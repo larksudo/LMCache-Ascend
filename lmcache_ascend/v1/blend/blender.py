@@ -29,7 +29,6 @@ class LMCBlender:
     ):
         self.cache_engine = cache_engine
         self.gpu_connector = gpu_connector
-
         self.layerwise_model = infer_model_from_vllm(vllm_model, self)
 
         # TODO: remove this hardcode
@@ -90,7 +89,7 @@ class LMCBlender:
         else:
             q, k = attn_layer.rotary_emb(self.metadata.positions, q, k)
 
-        if layer_id in self.common_metadata.check_layers:
+        if layer_id in self.common_metadata.check_layers and self.common_metadata.recomp_ratios[0]>0:
             assert k[num_falses:].shape[0] == old_k.shape[0], (
                 "Mismatch between number of tokens in k "
                 "(after skipping falses) and old_k"
