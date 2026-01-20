@@ -6,6 +6,10 @@
   LMCache-Ascend Plugin
   </h3>
 
+  [![Code Quality](https://github.com/LMCache/LMCache-Ascend/actions/workflows/code-quality.yml/badge.svg?branch=main)](https://github.com/LMCache/LMCache-Ascend/actions/workflows/code-quality.yml)
+  
+  <br />
+
   <p align="center">
   | <a href="https://www.hiascend.com/en/"><b>About Ascend</b></a>
   | <a href="https://blog.lmcache.ai/"><b> LMCache Blog</b></a> 
@@ -32,8 +36,8 @@ To use LMCache-Ascend on the NPU hardware, please make sure the following prereq
   - **Python**: >= 3.10, <= 3.11
   - **CANN Toolkit**: >= 8.2.RC1
   - **Ascend Driver**: >= 24.1.0
-  - **PyTorch**: == 2.7.1 (For vLLM 0.10.2+)
-  - **vLLM**: v0.10.2 & **vLLM-Ascend**: v0.10.2rc1
+  - **PyTorch**: >= 2.7.1 (For vLLM 0.10.2+)
+  - **vLLM**: v0.11.0 & **vLLM-Ascend**: v0.11.0
 
 ### Compatibility Matrix
 
@@ -42,6 +46,7 @@ Please ensure your environment matches the versions below.
 #### for PyTorch
 | LMCache-Ascend | vLLM Version | PyTorch / Torch-NPU | Status |
 | :--- | :--- | :--- | :--- |
+| **v0.3.12** | **v0.11.0** | **2.7.1** | 🚧 **Experimental** |
 | **v0.3.7** | **v0.10.2** | **2.7.1** | ✅ **Verified (Recommended)** |
 | **v0.3.7** | **v0.11.x** | **2.7.1** | 🚧 **Experimental** |
 | v0.3.3 | v0.9.2 | 2.5.1 | ⚠️ Legacy Support |
