@@ -36,12 +36,15 @@ void multi_layer_kv_transfer(
     const torch::Tensor &key_value_ptrs, // [num_layers]
     const torch::Tensor &slot_mapping,   // [num_tokens]
     const torch::Device &paged_memory_device, const int page_buffer_size,
-    const bool direction, const bool use_mla, const int kvcache_format_raw) {
+    const bool direction, const bool use_mla, const int kvcache_format_raw,
+    const int64_t k_hidden_dims, const int64_t v_hidden_dims,
+    const int64_t dsa_hidden_dims) {
   uint8_t *key_value_ptr = get_kernel_ptr<uint8_t, torch::Tensor>(key_value);
 
   MultiLayerKVConfig config = prepare_multi_layer_kv_config(
       key_value, key_value_ptrs, slot_mapping, paged_memory_device,
-      page_buffer_size, direction, use_mla, kvcache_format_raw);
+      page_buffer_size, direction, use_mla, kvcache_format_raw,
+      k_hidden_dims, v_hidden_dims, dsa_hidden_dims);
 
   // Calculate UB buffer parameters
   compute_multi_layer_ub_params(config, key_value, paged_memory_device,
@@ -58,7 +61,8 @@ void multi_layer_kv_transfer(
         config.stream, config.page_buffer_ptrs, key_value_ptr,
         config.slot_mapping_ptr, config.hidden_dims, config.kv_size,
         config.num_layers, config.page_buffer_size, config.num_tokens,
-        config.singlePerLoopBuffer, config.maxTokensPerLoop, config.direction);
+        config.singlePerLoopBuffer, config.maxTokensPerLoop, config.direction,
+        config.k_hidden_dims, config.v_hidden_dims, config.dsa_hidden_dims);
     return 0;
   });
   cmd.Run();
@@ -72,7 +76,9 @@ void fused_multi_layer_kv_transfer(
     const torch::Tensor &slot_mapping,   // [num_tokens]
     const torch::Device &paged_memory_device, const int page_buffer_size,
     const bool direction, // true: from_gpu, false: to_gpu
-    const bool use_mla, const int kvcache_format_raw) {
+    const bool use_mla, const int kvcache_format_raw,
+    const int64_t k_hidden_dims, const int64_t v_hidden_dims,
+    const int64_t dsa_hidden_dims) {
   // get host cpu buffer pointer for aclrtMemcpyAsync
   uint8_t *key_value_ptr = static_cast<uint8_t *>(key_value.data_ptr());
   uint8_t *staging_cache_ptr =
@@ -80,7 +86,8 @@ void fused_multi_layer_kv_transfer(
 
   MultiLayerKVConfig config = prepare_multi_layer_kv_config(
       key_value, key_value_ptrs, slot_mapping, paged_memory_device,
-      page_buffer_size, direction, use_mla, kvcache_format_raw);
+      page_buffer_size, direction, use_mla, kvcache_format_raw,
+      k_hidden_dims, v_hidden_dims, dsa_hidden_dims);
 
   compute_multi_layer_ub_params(config, key_value, paged_memory_device,
                                 key_value_ptrs);
@@ -121,7 +128,8 @@ void fused_multi_layer_kv_transfer(
         config.stream, config.page_buffer_ptrs, staging_cache_ptr,
         config.slot_mapping_ptr, config.hidden_dims, config.kv_size,
         config.num_layers, config.page_buffer_size, config.num_tokens,
-        config.singlePerLoopBuffer, config.maxTokensPerLoop, config.direction);
+        config.singlePerLoopBuffer, config.maxTokensPerLoop, config.direction,
+        config.k_hidden_dims, config.v_hidden_dims, config.dsa_hidden_dims);
 
     // Step 3: D2H memcpy (from_gpu)
     if (!isH2D) {

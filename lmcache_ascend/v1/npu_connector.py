@@ -52,7 +52,7 @@ class KVCacheFormat(Enum):
     UNDEFINED = 0
 
     MERGED_KV = auto()
-    """merge format (eg: vLLM 0.9.2 ...)
+    """Merge format (eg: vLLM 0.9.2 ...)
     layer: [num_kv, num_blocks, block_size, num_heads, head_dim]
     """
 
@@ -70,17 +70,63 @@ class KVCacheFormat(Enum):
     - V_tensor.shape = [layer_nums, num_blocks, block_size, num_heads, head_dim]
     """
 
+    MLA_KV = auto()
+    """MLA format for DeepSeek V2/V3 models
+    layer: tuple: (k_cache, v_cache) where K and V have different dimensions
+    - k_cache.shape = [num_blocks, block_size, num_kv_heads, kv_lora_rank]
+    - v_cache.shape = [num_blocks, block_size, num_kv_heads, qk_rope_head_dim]
+
+    This format is used when K/V shapes differ (detected automatically).
+    """
+
+    DSA_KV = auto()
+    """DSA (Deep Sparse Attention) format for DeepSeek V3.2 sparse models
+    layer: tuple: (k_cache, v_cache, dsa_k_cache)
+    - k_cache.shape = [num_blocks, block_size, num_kv_heads, kv_lora_rank]
+    - v_cache.shape = [num_blocks, block_size, num_kv_heads, qk_rope_head_dim]
+    - dsa_k_cache.shape = [num_blocks, block_size, 1, 128]
+
+    This format is used for sparse attention with lightning indexer.
+    """
+
     def is_separate_format(self) -> bool:
         return self == KVCacheFormat.SEPARATE_KV
 
     def is_merged_format(self) -> bool:
         return self == KVCacheFormat.MERGED_KV
 
+    def is_mla_format(self) -> bool:
+        return self == KVCacheFormat.MLA_KV
+
+    def is_dsa_format(self) -> bool:
+        return self == KVCacheFormat.DSA_KV
+
+    def is_tuple_format(self) -> bool:
+        return self in (KVCacheFormat.SEPARATE_KV, KVCacheFormat.MLA_KV, KVCacheFormat.DSA_KV)
+
+    def get_kv_size(self) -> int:
+        if self == KVCacheFormat.DSA_KV:
+            return 3
+        elif self in (KVCacheFormat.SEPARATE_KV, KVCacheFormat.MLA_KV):
+            return 2
+        elif self == KVCacheFormat.MERGED_KV:
+            return 1
+        return 0
+
     @staticmethod
     def detect(
-        kvcaches: List[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]],
+        kvcaches: List[Union[torch.Tensor, Tuple[torch.Tensor, ...]]],
         use_mla: bool = False,
     ) -> "KVCacheFormat":
+        """
+        Automatically detect KV cache format based on data structure.
+
+        Detection logic:
+        1. DSA_KV: tuple with 3 elements (k_cache, v_cache, dsa_k_cache)
+        2. MLA_KV: tuple with 2 elements where K/V shapes differ
+        3. SEPARATE_KV: tuple with 2 elements where K/V shapes are same
+        4. MERGED_KV: single tensor with specific shape patterns
+        """
         if not kvcaches:
             return KVCacheFormat.UNDEFINED
 
@@ -92,23 +138,51 @@ class KVCacheFormat(Enum):
                 return KVCacheFormat.SEPARATE_KV
 
         if isinstance(first_cache, tuple):
+            tuple_len = len(first_cache)
+
+            # DSA_KV: tuple with 3 elements (k_cache, v_cache, dsa_k_cache)
+            if tuple_len == 3:
+                k_cache, v_cache, dsa_k_cache = first_cache
+                if all(isinstance(t, torch.Tensor) for t in first_cache):
+                    if k_cache.shape != v_cache.shape:
+                        logger.debug(
+                            f"Detected DSA_KV format: k_shape={k_cache.shape}, "
+                            f"v_shape={v_cache.shape}, dsa_k_shape={dsa_k_cache.shape}"
+                        )
+                        return KVCacheFormat.DSA_KV
+
+            # MLA_KV or SEPARATE_KV: tuple with 2 elements
+            if tuple_len == 2:
+                k_cache, v_cache = first_cache
+                if isinstance(k_cache, torch.Tensor) and isinstance(v_cache, torch.Tensor):
+                    # MLA_KV: K/V shapes differ
+                    if k_cache.shape != v_cache.shape:
+                        logger.debug(
+                            f"Detected MLA_KV format: k_shape={k_cache.shape}, "
+                            f"v_shape={v_cache.shape}"
+                        )
+                        return KVCacheFormat.MLA_KV
+                    # SEPARATE_KV: K/V shapes are same
+                    return KVCacheFormat.SEPARATE_KV
+
             return KVCacheFormat.SEPARATE_KV
+
         elif isinstance(first_cache, torch.Tensor):
             ndim = first_cache.ndim
             shape = first_cache.shape
 
-            # MLA detect
+            # MLA detect (single tensor format)
             # MLA Shape: [num_blocks, block_size, head_size] (3D)
             #         or: [1, num_blocks, block_size, head_size] (4D with first dim = 1)
             is_mla_shape = (ndim == 3) or (ndim == 4 and shape[0] == 1)
             if use_mla or is_mla_shape:
                 return KVCacheFormat.MERGED_KV
 
-            # Flash Attention：[2, num_blocks, block_size, num_heads, head_size]
+            # Flash Attention: [2, num_blocks, block_size, num_heads, head_size]
             if ndim == 5 and shape[0] == 2:
                 return KVCacheFormat.MERGED_KV
 
-            # Flash Infer：[num_blocks, 2, block_size, num_heads, head_size]
+            # Flash Infer: [num_blocks, 2, block_size, num_heads, head_size]
             if ndim == 5 and shape[1] == 2:
                 return KVCacheFormat.MERGED_KV
 
@@ -567,7 +641,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 "Unable to determine the format of input kv_caches."
             )
 
-        if self.kv_format.is_separate_format():
+        if self.kv_format.is_tuple_format():
             self.kvcaches_device = kv_caches[0][0].device
         else:
             self.kvcaches_device = kv_caches[0].device
@@ -578,9 +652,36 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         if idx in self.kv_cache_pointers_on_gpu:
             return self.kv_cache_pointers_on_gpu[idx]
 
-        if self.kv_format == KVCacheFormat.SEPARATE_KV:
-            self.kv_size = 2
-            pointers_list = []
+        self.kv_size = self.kv_format.get_kv_size()
+        pointers_list = []
+
+        if self.kv_format == KVCacheFormat.DSA_KV:
+            for cache_tuple in kv_caches:
+                k_cache, v_cache, dsa_k_cache = cache_tuple
+                pointers_list.append(k_cache.data_ptr())
+                pointers_list.append(v_cache.data_ptr())
+                pointers_list.append(dsa_k_cache.data_ptr())
+
+            self.kv_cache_pointers = torch.empty(
+                self.num_layers * self.kv_size, dtype=torch.int64, device="cpu"
+            )
+            logger.debug(
+                f"DSA_KV format detected: kv_size=3, "
+                f"k_shape={k_cache.shape}, v_shape={v_cache.shape}, "
+                f"dsa_k_shape={dsa_k_cache.shape}"
+            )
+        elif self.kv_format == KVCacheFormat.MLA_KV:
+            for k_cache, v_cache in kv_caches:
+                pointers_list.append(k_cache.data_ptr())
+                pointers_list.append(v_cache.data_ptr())
+
+            self.kv_cache_pointers = torch.empty(
+                self.num_layers * self.kv_size, dtype=torch.int64, device="cpu"
+            )
+            logger.debug(
+                f"MLA_KV format detected: k_shape={k_cache.shape}, v_shape={v_cache.shape}"
+            )
+        elif self.kv_format == KVCacheFormat.SEPARATE_KV:
             for k, v in kv_caches:
                 pointers_list.append(k.data_ptr())
                 pointers_list.append(v.data_ptr())
@@ -589,7 +690,6 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 self.num_layers * self.kv_size, dtype=torch.int64, device="cpu"
             )
         else:
-            self.kv_size = 1
             pointers_list = [t.data_ptr() for t in kv_caches]
 
             self.kv_cache_pointers = torch.empty(
@@ -605,34 +705,46 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         self.kv_cache_pointers_on_gpu[idx].copy_(self.kv_cache_pointers)
 
         first_tensor = (
-            kv_caches[0][0] if self.kv_format.is_separate_format() else kv_caches[0]
+            kv_caches[0][0] if self.kv_format.is_tuple_format() else kv_caches[0]
         )
 
-        if self.use_mla:
-            # kv_caches[0].shape: [num_pages, page_size, head_size]
-            # kv_caches[0].shape: [1, num_pages, page_size, head_size] (vllm-Ascend)
-            self.page_buffer_size = kv_caches[0].shape[-3] * kv_caches[0].shape[-2]
+        if self.use_mla or self.kv_format in (KVCacheFormat.MLA_KV, KVCacheFormat.DSA_KV):
+            if self.kv_format == KVCacheFormat.MLA_KV:
+                k_cache, v_cache = kv_caches[0]
+                self.page_buffer_size = k_cache.shape[-3] * k_cache.shape[-2]
+                self.kv_lora_rank = k_cache.shape[-1]
+                self.qk_rope_head_dim = v_cache.shape[-1]
+                logger.debug(
+                    f"MLA_KV format: page_buffer_size={self.page_buffer_size}, "
+                    f"kv_lora_rank={self.kv_lora_rank}, qk_rope_head_dim={self.qk_rope_head_dim}"
+                )
+            elif self.kv_format == KVCacheFormat.DSA_KV:
+                k_cache, v_cache, dsa_k_cache = kv_caches[0]
+                self.page_buffer_size = k_cache.shape[-3] * k_cache.shape[-2]
+                self.kv_lora_rank = k_cache.shape[-1]
+                self.qk_rope_head_dim = v_cache.shape[-1]
+                self.dsa_head_dim = dsa_k_cache.shape[-1]
+                logger.debug(
+                    f"DSA_KV format: page_buffer_size={self.page_buffer_size}, "
+                    f"kv_lora_rank={self.kv_lora_rank}, qk_rope_head_dim={self.qk_rope_head_dim}, "
+                    f"dsa_head_dim={self.dsa_head_dim}"
+                )
         else:
+            # vllm 0.9.2 ...
+            # kv_caches[0].shape: [2, num_pages, page_size, num_heads, head_size]
+            # 310P: [2, num_blocks, num_kv_heads * head_size // 16, block_size, 16]
+            # 910B: [2, num_blocks, block_size, num_kv_heads, head_size]
             if self.kv_format == KVCacheFormat.SEPARATE_KV:
-                # kv_caches[0]: [tuple(k,v)]
-                # 310P: [num_blocks, num_kv_heads * head_size // 16, block_size, 16]
-                # 910B: [num_blocks, block_size, num_kv_heads, head_size]
+                # kv_caches[0]: [tuple(k,v)，tuple(k,v)]
                 assert first_tensor.dim() >= 2
-                if is_310p():
-                    self.block_size = first_tensor.shape[-2]
-                    self.page_buffer_size = first_tensor.shape[0] * self.block_size
-                else:
-                    self.page_buffer_size = (
-                        first_tensor.shape[0] * first_tensor.shape[1]
-                    )
-
+                # TODO: 310p (num_blocks, hidden_dim_aligned, block_size, 16)
+                self.page_buffer_size = (
+                    first_tensor.shape[0] * first_tensor.shape[1]
+                )
             elif self.kv_format == KVCacheFormat.MERGED_KV:
-                # kv_caches[0].shape: [2, num_pages, page_size, num_heads, head_size]
-                # 310P: [2, num_blocks, num_kv_heads * head_size // 16, block_size, 16]
-                # 910B: [2, num_blocks, block_size, num_kv_heads, head_size]
                 assert first_tensor.dim() == 5
                 if is_310p():
-                    self.block_size = first_tensor.shape[-2]
+                    self.block_size = first_tensor.shape[3]
                     self.page_buffer_size = first_tensor.shape[1] * self.block_size
                 else:
                     self.page_buffer_size = (
@@ -815,7 +927,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             self.page_buffer_size,
             False,
             self.use_mla,
-            self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
+            self.kv_format.value,
+            self.kv_lora_rank if hasattr(self, 'kv_lora_rank') and self.kv_lora_rank is not None else 0,
+            self.qk_rope_head_dim if hasattr(self, 'qk_rope_head_dim') and self.qk_rope_head_dim is not None else 0,
+            self.dsa_head_dim if hasattr(self, 'dsa_head_dim') and self.dsa_head_dim is not None else 0,
         )
 
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -863,7 +978,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     self.page_buffer_size,
                     True,
                     self.use_mla,
-                    self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
+                    self.kv_format.value,
+                    self.kv_lora_rank if hasattr(self, 'kv_lora_rank') and self.kv_lora_rank is not None else 0,
+                    self.qk_rope_head_dim if hasattr(self, 'qk_rope_head_dim') and self.qk_rope_head_dim is not None else 0,
+                    self.dsa_head_dim if hasattr(self, 'dsa_head_dim') and self.dsa_head_dim is not None else 0,
                 )
             else:
                 assert self.gpu_buffer.device == self.kvcaches_device
@@ -877,7 +995,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     self.page_buffer_size,
                     True,  # from_gpu
                     self.use_mla,
-                    self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
+                    self.kv_format.value,
+                    self.kv_lora_rank if hasattr(self, 'kv_lora_rank') and self.kv_lora_rank is not None else 0,
+                    self.qk_rope_head_dim if hasattr(self, 'qk_rope_head_dim') and self.qk_rope_head_dim is not None else 0,
+                    self.dsa_head_dim if hasattr(self, 'dsa_head_dim') and self.dsa_head_dim is not None else 0,
                 )
 
         if not memory_obj.tensor.is_cuda:
