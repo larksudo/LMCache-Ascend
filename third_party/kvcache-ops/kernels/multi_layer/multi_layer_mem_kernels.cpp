@@ -59,17 +59,36 @@ template<>                                                                      
 struct StandardLauncher<TYPE, SLOTTYPE, KVCacheFormat::FMT> {                                          \
     static void Launch(uint32_t blockDim, void *stream,                                                \
                       uint8_t *pagedKVCaches, uint8_t *dstCacheTensor, uint8_t *slotmappings,          \
-                      const StandardConfig& config)                                                    \
+                      const StandardConfig& config,                                                    \
+                      int64_t kHiddenDims = 0, int64_t vHiddenDims = 0, int64_t dsaHiddenDims = 0)     \
     {                                                                                                  \
+        (void)kHiddenDims; (void)vHiddenDims; (void)dsaHiddenDims;                                     \
         MULTI_LAYER_PAGED_KV_COPY_KERNEL_NAME(TYPE, SLOTTYPE, FMT)<<<blockDim, nullptr, stream>>>(     \
         pagedKVCaches, dstCacheTensor, slotmappings, config.hiddenDims, config.kvs, config.numLayers,  \
         config.pageBuffSize, config.numTokensChunk, blockDim, config.page2L);                          \
     }                                                                                                  \
 };
 
+#define SPECIALIZE_KERNEL_LAUNCHER_STANDARD_UNSUPPORTED(TYPE, SLOTTYPE, FMT)                           \
+template<>                                                                                             \
+struct StandardLauncher<TYPE, SLOTTYPE, KVCacheFormat::FMT> {                                          \
+    static void Launch(uint32_t blockDim, void *stream,                                                \
+                      uint8_t *pagedKVCaches, uint8_t *dstCacheTensor, uint8_t *slotmappings,          \
+                      const StandardConfig& config,                                                    \
+                      int64_t kHiddenDims = 0, int64_t vHiddenDims = 0, int64_t dsaHiddenDims = 0)     \
+    {                                                                                                  \
+        (void)blockDim; (void)stream; (void)pagedKVCaches; (void)dstCacheTensor; (void)slotmappings;   \
+        (void)config; (void)kHiddenDims; (void)vHiddenDims; (void)dsaHiddenDims;                       \
+        ASCENDC_REPORT_NOT_SUPPORT(false, #FMT " is not supported in StandardLauncher.");              \
+        throw std::runtime_error(#FMT " format is not supported in StandardLauncher.");                \
+    }                                                                                                  \
+};
+
 #define EXPAND_LAUNCHER_STANDARD_FMT(TYPE, SLOTTYPE) \
     SPECIALIZE_KERNEL_LAUNCHER_STANDARD(TYPE, SLOTTYPE, MERGED_KV) \
-    SPECIALIZE_KERNEL_LAUNCHER_STANDARD(TYPE, SLOTTYPE, SEPARATE_KV)
+    SPECIALIZE_KERNEL_LAUNCHER_STANDARD(TYPE, SLOTTYPE, SEPARATE_KV) \
+    SPECIALIZE_KERNEL_LAUNCHER_STANDARD_UNSUPPORTED(TYPE, SLOTTYPE, MLA_KV) \
+    SPECIALIZE_KERNEL_LAUNCHER_STANDARD_UNSUPPORTED(TYPE, SLOTTYPE, DSA_KV)
 
 #define EXPAND_LAUNCHER_STANDARD_SLOT(TYPE) \
     EXPAND_LAUNCHER_STANDARD_FMT(TYPE, int32_t) \
@@ -84,7 +103,8 @@ EXPAND_LAUNCHER_STANDARD_SLOT(bfloat16_t)
 extern void multi_layer_kv_transfer_kernel(kvcache_ops::AscendType type, kvcache_ops::AscendType slotType, const kvcache_ops::KVCacheFormat kvcacheFormat,
                                            uint32_t blockDim, void *stream, uint8_t *pagedKVCaches, uint8_t *dstCacheTensor, 
                                            uint8_t *slotmappings, const int64_t hiddenDims, const int32_t kvs, const int32_t numLayers, 
-                                           const int64_t pageBuffSize, const int32_t numTokensChunk, const bool page2L)
+                                           const int64_t pageBuffSize, const int32_t numTokensChunk, const bool page2L,
+                                           int64_t kHiddenDims = 0, int64_t vHiddenDims = 0, int64_t dsaHiddenDims = 0)
 {
     auto config = MakeStandardConfig(
         hiddenDims, numLayers, pageBuffSize, numTokensChunk, kvs, page2L
@@ -94,18 +114,21 @@ extern void multi_layer_kv_transfer_kernel(kvcache_ops::AscendType type, kvcache
         case AscendType::FP16:
             dispatch_paged_kernel_on_slot_type<StandardLauncher, half>(
                 slotType, kvcacheFormat, blockDim, stream, 
-                pagedKVCaches, dstCacheTensor, slotmappings, config);
+                pagedKVCaches, dstCacheTensor, slotmappings, config,
+                kHiddenDims, vHiddenDims, dsaHiddenDims);
             break;
         case AscendType::INT8:
             dispatch_paged_kernel_on_slot_type<StandardLauncher, int8_t>(
                 slotType, kvcacheFormat, blockDim, stream, 
-                pagedKVCaches, dstCacheTensor, slotmappings, config);
+                pagedKVCaches, dstCacheTensor, slotmappings, config,
+                kHiddenDims, vHiddenDims, dsaHiddenDims);
             break;
 #if (ASCEND_AICORE_ARCH >= 220)
         case AscendType::BF16:
             dispatch_paged_kernel_on_slot_type<StandardLauncher, bfloat16_t>(
                 slotType, kvcacheFormat, blockDim, stream, 
-                pagedKVCaches, dstCacheTensor, slotmappings, config);
+                pagedKVCaches, dstCacheTensor, slotmappings, config,
+                kHiddenDims, vHiddenDims, dsaHiddenDims);
             break;
 #endif
         default:

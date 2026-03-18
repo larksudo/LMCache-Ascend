@@ -62,8 +62,10 @@ template<>                                                                      
 struct Chunk310PLauncher<TYPE, SLOTTYPE, KVCacheFormat::FMT> {                                                   \
     static void Launch(uint32_t blockDim, void *stream,                                                          \
                       uint8_t *pagedKVCaches, uint8_t *dstCacheTensor, uint8_t *slotmappings,                    \
-                      const Chunk310PConfig& config)                                                             \
+                      const Chunk310PConfig& config,                                                             \
+                      int64_t kHiddenDims = 0, int64_t vHiddenDims = 0, int64_t dsaHiddenDims = 0)               \
     {                                                                                                            \
+        (void)kHiddenDims; (void)vHiddenDims; (void)dsaHiddenDims;                                               \
         MULTI_LAYER_PAGED_KV_COPY_310P_KERNEL_NAME(TYPE, SLOTTYPE, FMT)<<<blockDim, nullptr, stream>>>(          \
             pagedKVCaches, dstCacheTensor, slotmappings, config.common.hiddenDims, config.common.kvs,            \
             config.numKVHead, config.headSize, config.common.numLayers, config.common.pageBuffSize,              \
@@ -71,9 +73,26 @@ struct Chunk310PLauncher<TYPE, SLOTTYPE, KVCacheFormat::FMT> {                  
     }                                                                                                            \
 };
 
+#define SPECIALIZE_KERNEL_LAUNCHER_310P_UNSUPPORTED(TYPE, SLOTTYPE, FMT)                                        \
+template<>                                                                                                       \
+struct Chunk310PLauncher<TYPE, SLOTTYPE, KVCacheFormat::FMT> {                                                   \
+    static void Launch(uint32_t blockDim, void *stream,                                                          \
+                      uint8_t *pagedKVCaches, uint8_t *dstCacheTensor, uint8_t *slotmappings,                    \
+                      const Chunk310PConfig& config,                                                             \
+                      int64_t kHiddenDims = 0, int64_t vHiddenDims = 0, int64_t dsaHiddenDims = 0)               \
+    {                                                                                                            \
+        (void)blockDim; (void)stream; (void)pagedKVCaches; (void)dstCacheTensor; (void)slotmappings;             \
+        (void)config; (void)kHiddenDims; (void)vHiddenDims; (void)dsaHiddenDims;                                 \
+        ASCENDC_REPORT_NOT_SUPPORT(false, #FMT " is not supported on 310P.");                                    \
+        throw std::runtime_error(#FMT " format is not supported on 310P.");                                      \
+    }                                                                                                            \
+};
+
 #define EXPAND_LAUNCHER_310P_FMT(TYPE, SLOTTYPE) \
     SPECIALIZE_KERNEL_LAUNCHER_310P(TYPE, SLOTTYPE, MERGED_KV) \
-    SPECIALIZE_KERNEL_LAUNCHER_310P(TYPE, SLOTTYPE, SEPARATE_KV)
+    SPECIALIZE_KERNEL_LAUNCHER_310P(TYPE, SLOTTYPE, SEPARATE_KV) \
+    SPECIALIZE_KERNEL_LAUNCHER_310P_UNSUPPORTED(TYPE, SLOTTYPE, MLA_KV) \
+    SPECIALIZE_KERNEL_LAUNCHER_310P_UNSUPPORTED(TYPE, SLOTTYPE, DSA_KV)
 
 #define EXPAND_LAUNCHER_310P_SLOT(TYPE) \
     EXPAND_LAUNCHER_310P_FMT(TYPE, int32_t) \

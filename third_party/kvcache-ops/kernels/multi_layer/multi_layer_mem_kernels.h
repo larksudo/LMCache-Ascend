@@ -568,7 +568,10 @@ struct StandardLauncher {
         uint8_t* pagedKVCaches, 
         uint8_t* dstCacheTensor, 
         uint8_t* slotmappings,
-        const StandardConfig& config); 
+        const StandardConfig& config,
+        int64_t kHiddenDims = 0,
+        int64_t vHiddenDims = 0,
+        int64_t dsaHiddenDims = 0); 
 };
 
 template<typename scalar_t, typename slot_t, KVCacheFormat fmt>
@@ -579,7 +582,10 @@ struct Chunk310PLauncher {
         uint8_t* pagedKVCaches, 
         uint8_t* dstCacheTensor, 
         uint8_t* slotmappings,
-        const Chunk310PConfig& config);
+        const Chunk310PConfig& config,
+        int64_t kHiddenDims = 0,
+        int64_t vHiddenDims = 0,
+        int64_t dsaHiddenDims = 0);
 };
 
 template<typename scalar_t, typename slot_t, KVCacheFormat fmt>
