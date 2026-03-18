@@ -583,9 +583,12 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         - chunk_size: The MAX size of the chunk to be copied to GPU.
         - dtype: The data type of the intermediate buffer.
         """
-        super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
-
         self.kv_format: KVCacheFormat = KVCacheFormat.UNDEFINED
+        self.kv_lora_rank: Optional[int] = None
+        self.qk_rope_head_dim: Optional[int] = None
+        self.dsa_head_dim: Optional[int] = None
+
+        super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
 
         if is_310p():
             assert "num_kv_head" in kwargs, ("num_kv_head should be provided in 310p",)
@@ -752,6 +755,119 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     )
 
         return self.kv_cache_pointers_on_gpu[idx]
+
+    def _lazy_initialize_buffer(self, kv_caches):
+        """
+        Lazily initialize the GPU buffer allocator if it is not initialized yet.
+        For MLA_KV and DSA_KV formats, we need to calculate the buffer size
+        based on the sum of K and V hidden_dims.
+        """
+        if self.use_gpu and self.gpu_buffer_allocator is None:
+            logger.info("Lazily initializing GPU buffer for VLLMPagedMemNPUConnectorV2.")
+
+            self.kv_format = KVCacheFormat.detect(kv_caches, use_mla=self.use_mla)
+
+            if self.kv_format == KVCacheFormat.UNDEFINED:
+                raise ValueError(
+                    "Undefined KV cache format detected. "
+                    "Unable to determine the format of input kv_caches."
+                )
+
+            logger.info(f"Detected KV cache format: {self.kv_format.name}")
+
+            first_layer_cache = kv_caches[0]
+
+            if self.kv_format == KVCacheFormat.MLA_KV:
+                k_cache, v_cache = first_layer_cache
+                self.kv_lora_rank = k_cache.shape[-1]
+                self.qk_rope_head_dim = v_cache.shape[-1]
+                total_hidden_dims = self.kv_lora_rank + self.qk_rope_head_dim
+                max_tokens = k_cache.shape[-3] * k_cache.shape[-2]
+                num_elements = self.num_layers * max_tokens * total_hidden_dims
+                gpu_buffer_size = num_elements * self.element_size
+
+                logger.info(
+                    f"MLA_KV buffer initialization:\n"
+                    f"  - kv_lora_rank: {self.kv_lora_rank}\n"
+                    f"  - qk_rope_head_dim: {self.qk_rope_head_dim}\n"
+                    f"  - total_hidden_dims: {total_hidden_dims}\n"
+                    f"  - max_tokens: {max_tokens}\n"
+                    f"  - gpu_buffer_size: {gpu_buffer_size / (1024 * 1024)} MB"
+                )
+
+            elif self.kv_format == KVCacheFormat.DSA_KV:
+                k_cache, v_cache, dsa_k_cache = first_layer_cache
+                self.kv_lora_rank = k_cache.shape[-1]
+                self.qk_rope_head_dim = v_cache.shape[-1]
+                self.dsa_head_dim = dsa_k_cache.shape[-1]
+                total_hidden_dims = self.kv_lora_rank + self.qk_rope_head_dim + self.dsa_head_dim
+                max_tokens = k_cache.shape[-3] * k_cache.shape[-2]
+                num_elements = self.num_layers * max_tokens * total_hidden_dims
+                gpu_buffer_size = num_elements * self.element_size
+
+                logger.info(
+                    f"DSA_KV buffer initialization:\n"
+                    f"  - kv_lora_rank: {self.kv_lora_rank}\n"
+                    f"  - qk_rope_head_dim: {self.qk_rope_head_dim}\n"
+                    f"  - dsa_head_dim: {self.dsa_head_dim}\n"
+                    f"  - total_hidden_dims: {total_hidden_dims}\n"
+                    f"  - max_tokens: {max_tokens}\n"
+                    f"  - gpu_buffer_size: {gpu_buffer_size / (1024 * 1024)} MB"
+                )
+
+            elif self.kv_format == KVCacheFormat.SEPARATE_KV:
+                key_tensor = first_layer_cache[0]
+                value_tensor = first_layer_cache[1]
+
+                assert key_tensor.shape == value_tensor.shape, (
+                    f"Key and Value tensors must have identical shapes, "
+                    f"got key={key_tensor.shape}, value={value_tensor.shape}"
+                )
+
+                k_cache_shape_per_layer = key_tensor.shape
+                max_tokens = k_cache_shape_per_layer[-3] * k_cache_shape_per_layer[-2]
+                num_elements = 2 * self.num_layers * max_tokens * self.hidden_dim_size
+                gpu_buffer_size = num_elements * self.element_size
+
+                logger.info(
+                    f"SEPARATE_KV buffer initialization:\n"
+                    f"  - Key cache shape per layer: {k_cache_shape_per_layer}\n"
+                    f"  - max_tokens: {max_tokens}\n"
+                    f"  - gpu_buffer_size: {gpu_buffer_size / (1024 * 1024)} MB"
+                )
+
+            elif self.kv_format == KVCacheFormat.MERGED_KV:
+                assert (
+                    first_layer_cache.shape[0] == 2 or first_layer_cache.shape[1] == 2
+                ), (
+                    "MERGED_KV format should have shape [2, num_blocks, "
+                    "block_size, num_heads, head_size] or "
+                    "[num_blocks, 2, block_size, num_heads, head_size]"
+                    f"Got shape: {first_layer_cache.shape}"
+                )
+
+                if first_layer_cache.shape[0] == 2:
+                    k_cache_shape_per_layer = first_layer_cache[0].shape
+                else:
+                    k_cache_shape_per_layer = first_layer_cache[:, 0].shape
+
+                max_tokens = k_cache_shape_per_layer[0] * k_cache_shape_per_layer[1]
+                num_elements = 2 * self.num_layers * max_tokens * self.hidden_dim_size
+                gpu_buffer_size = num_elements * self.element_size
+
+                logger.info(
+                    f"MERGED_KV buffer initialization:\n"
+                    f"  - Key cache shape per layer: {k_cache_shape_per_layer}\n"
+                    f"  - max_tokens: {max_tokens}\n"
+                    f"  - gpu_buffer_size: {gpu_buffer_size / (1024 * 1024)} MB"
+                )
+
+            else:
+                raise ValueError(f"Unsupported KV cache format: {self.kv_format}")
+
+            self.gpu_buffer_allocator = GPUMemoryAllocator(
+                gpu_buffer_size, device=self.device
+            )
 
     def to_gpu_310p(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
@@ -1209,8 +1325,15 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 self.from_gpu(memory_obj, start, end, **kwargs)
 
     def get_shape(self, num_tokens: int) -> torch.Size:
-        kv_size = 1 if self.use_mla else 2
-        return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
+        if self.kv_format in (KVCacheFormat.MLA_KV, KVCacheFormat.DSA_KV):
+            if self.kv_format == KVCacheFormat.MLA_KV:
+                total_hidden_dims = self.kv_lora_rank + self.qk_rope_head_dim
+            else:
+                total_hidden_dims = self.kv_lora_rank + self.qk_rope_head_dim + self.dsa_head_dim
+            return torch.Size([1, self.num_layers, num_tokens, total_hidden_dims])
+        else:
+            kv_size = 1 if self.use_mla else 2
+            return torch.Size([kv_size, self.num_layers, num_tokens, self.hidden_dim_size])
 
 
 class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):

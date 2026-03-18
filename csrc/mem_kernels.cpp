@@ -93,9 +93,27 @@ void fused_multi_layer_kv_transfer(
                                 key_value_ptrs);
 
   // Calculate and verify the CPU buffer size
-  size_t cpu_buffer_size = static_cast<size_t>(config.kv_size) *
-                           config.num_layers * config.num_tokens *
-                           config.hidden_dims * key_value.element_size();
+  // For MLA_KV and DSA_KV, K/V have different hidden_dims
+  size_t cpu_buffer_size = 0;
+  switch (config.kvcache_format) {
+    case kvcache_ops::KVCacheFormat::MLA_KV:
+      cpu_buffer_size = static_cast<size_t>(config.num_layers) *
+                        config.num_tokens *
+                        (config.k_hidden_dims + config.v_hidden_dims) *
+                        key_value.element_size();
+      break;
+    case kvcache_ops::KVCacheFormat::DSA_KV:
+      cpu_buffer_size = static_cast<size_t>(config.num_layers) *
+                        config.num_tokens *
+                        (config.k_hidden_dims + config.v_hidden_dims + config.dsa_hidden_dims) *
+                        key_value.element_size();
+      break;
+    default:
+      cpu_buffer_size = static_cast<size_t>(config.kv_size) *
+                        config.num_layers * config.num_tokens *
+                        config.hidden_dims * key_value.element_size();
+      break;
+  }
 
   TORCH_CHECK(
       staging_cache.numel() * staging_cache.element_size() >= cpu_buffer_size,
