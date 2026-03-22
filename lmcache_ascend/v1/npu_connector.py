@@ -588,15 +588,36 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         self.qk_rope_head_dim: Optional[int] = None
         self.dsa_head_dim: Optional[int] = None
 
-        super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
+        self.hidden_dim_size = hidden_dim_size
+        self.num_layers = num_layers
+        self.kv_cache_pointers = torch.empty(
+            num_layers, dtype=torch.int64, device="cpu"
+        )
+        self.kv_cache_pointers_on_gpu: dict[int, torch.Tensor] = {}
+        self.page_buffer_size = 0
+        self.kvcaches: Optional[List[torch.Tensor]] = None
+        self.gpu_buffer: Optional[torch.Tensor] = None
+        self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
+        self.use_gpu = use_gpu
+
+        self.dtype = kwargs.get("dtype", torch.bfloat16)
+        self.element_size = torch.tensor([], dtype=self.dtype).element_size()
+        self.device = kwargs.get("device", torch.device("npu:0"))
+
+        if use_gpu:
+            assert "chunk_size" in kwargs, (
+                "chunk_size should be provided to create a GPU buffer."
+            )
+            self.chunk_size = kwargs["chunk_size"]
+
+        self.store_stream = torch.cuda.Stream()
+        self.load_stream = torch.cuda.Stream()
 
         if is_310p():
             assert "num_kv_head" in kwargs, ("num_kv_head should be provided in 310p",)
             assert "head_size" in kwargs, ("head_size should be provided in 310p",)
             self.num_kv_head = kwargs["num_kv_head"]
             self.head_size = kwargs["head_size"]
-            self.dtype = kwargs["dtype"]
-            self.device = kwargs["device"]
 
     @classmethod
     def from_metadata(
@@ -758,11 +779,11 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
     def _lazy_initialize_buffer(self, kv_caches):
         """
-        Lazily initialize the GPU buffer allocator if it is not initialized yet.
+        Lazily initialize the GPU buffer if it is not initialized yet.
         For MLA_KV and DSA_KV formats, we need to calculate the buffer size
         based on the sum of K and V hidden_dims.
         """
-        if self.use_gpu and self.gpu_buffer_allocator is None:
+        if self.use_gpu and self.gpu_buffer is None:
             logger.info("Lazily initializing GPU buffer for VLLMPagedMemNPUConnectorV2.")
 
             self.kv_format = KVCacheFormat.detect(kv_caches, use_mla=self.use_mla)
@@ -865,9 +886,12 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             else:
                 raise ValueError(f"Unsupported KV cache format: {self.kv_format}")
 
-            self.gpu_buffer_allocator = GPUMemoryAllocator(
-                gpu_buffer_size, device=self.device
+            # Create the GPU buffer directly
+            buffer_shape = self.get_shape(max_tokens)
+            self.gpu_buffer = torch.empty(
+                buffer_shape, dtype=self.dtype, device=self.device
             )
+            logger.info(f"Created GPU buffer with shape: {buffer_shape}")
 
     def to_gpu_310p(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
@@ -1082,6 +1106,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
         if self.kv_format == KVCacheFormat.UNDEFINED:
             raise ValueError("KV cache format is not initialized!")
+
+        # Lazy initialize GPU buffer if needed
+        if self.use_gpu and self.gpu_buffer is None:
+            self._lazy_initialize_buffer(self.kvcaches)
 
         with torch.cuda.stream(self.store_stream):
             # No staging buffer or token count mismatch
