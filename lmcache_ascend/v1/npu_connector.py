@@ -735,7 +735,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         if self.use_mla or self.kv_format in (KVCacheFormat.MLA_KV, KVCacheFormat.DSA_KV):
             if self.kv_format == KVCacheFormat.MLA_KV:
                 k_cache, v_cache = kv_caches[0]
-                self.page_buffer_size = k_cache.shape[-3] * k_cache.shape[-2]
+                self.page_buffer_size = k_cache.shape[0] * k_cache.shape[1]
                 self.kv_lora_rank = k_cache.shape[-1]
                 self.qk_rope_head_dim = v_cache.shape[-1]
                 logger.debug(
@@ -744,7 +744,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 )
             elif self.kv_format == KVCacheFormat.DSA_KV:
                 k_cache, v_cache, dsa_k_cache = kv_caches[0]
-                self.page_buffer_size = k_cache.shape[-3] * k_cache.shape[-2]
+                self.page_buffer_size = k_cache.shape[0] * k_cache.shape[1]
                 self.kv_lora_rank = k_cache.shape[-1]
                 self.qk_rope_head_dim = v_cache.shape[-1]
                 self.dsa_head_dim = dsa_k_cache.shape[-1]
@@ -803,7 +803,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 self.kv_lora_rank = k_cache.shape[-1]
                 self.qk_rope_head_dim = v_cache.shape[-1]
                 total_hidden_dims = self.kv_lora_rank + self.qk_rope_head_dim
-                max_tokens = k_cache.shape[-3] * k_cache.shape[-2]
+                max_tokens = k_cache.shape[0] * k_cache.shape[1]
                 num_elements = self.num_layers * max_tokens * total_hidden_dims
                 gpu_buffer_size = num_elements * self.element_size
 
@@ -822,7 +822,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 self.qk_rope_head_dim = v_cache.shape[-1]
                 self.dsa_head_dim = dsa_k_cache.shape[-1]
                 total_hidden_dims = self.kv_lora_rank + self.qk_rope_head_dim + self.dsa_head_dim
-                max_tokens = k_cache.shape[-3] * k_cache.shape[-2]
+                max_tokens = k_cache.shape[0] * k_cache.shape[1]
                 num_elements = self.num_layers * max_tokens * total_hidden_dims
                 gpu_buffer_size = num_elements * self.element_size
 
