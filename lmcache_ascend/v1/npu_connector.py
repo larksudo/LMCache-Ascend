@@ -886,12 +886,58 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             else:
                 raise ValueError(f"Unsupported KV cache format: {self.kv_format}")
 
-            # Create the GPU buffer directly
-            buffer_shape = self.get_shape(max_tokens)
+            # The staging buffer only needs to cover one LMCache chunk.
+            staging_tokens = min(max_tokens, self.chunk_size)
+            buffer_shape = self.get_shape(staging_tokens)
             self.gpu_buffer = torch.empty(
                 buffer_shape, dtype=self.dtype, device=self.device
             )
-            logger.info(f"Created GPU buffer with shape: {buffer_shape}")
+            logger.info(
+                "Created GPU staging buffer with shape: %s "
+                "(chunk_size=%s, max_tokens=%s, kv_format=%s)",
+                buffer_shape,
+                self.chunk_size,
+                max_tokens,
+                self.kv_format.name,
+            )
+
+    def _validate_memory_obj_shape(self, memory_obj: MemoryObj, num_tokens: int) -> None:
+        """Validate that the LMCache buffer shape matches the detected KV format."""
+        expected_shape = self.get_shape(num_tokens)
+        actual_shape = memory_obj.tensor.shape
+        if actual_shape != expected_shape:
+            raise ValueError(
+                "Memory object shape does not match the detected KV cache format. "
+                f"Expected {expected_shape}, got {actual_shape}. "
+                f"kv_format={self.kv_format.name}"
+            )
+
+    def _format_transfer_debug_info(
+        self,
+        op_name: str,
+        memory_obj: MemoryObj,
+        start: int,
+        end: int,
+        fused: Optional[bool] = None,
+    ) -> str:
+        details = [
+            f"op={op_name}",
+            f"token_range=[{start}, {end})",
+            f"num_tokens={end - start}",
+            f"memory_shape={tuple(memory_obj.tensor.shape)}",
+            f"memory_fmt={memory_obj.metadata.fmt.name}",
+            f"kv_format={self.kv_format.name}",
+            f"use_gpu={self.use_gpu}",
+            f"page_buffer_size={self.page_buffer_size}",
+            f"kv_lora_rank={self.kv_lora_rank}",
+            f"qk_rope_head_dim={self.qk_rope_head_dim}",
+            f"dsa_head_dim={self.dsa_head_dim}",
+        ]
+        if fused is not None:
+            details.append(f"fused_path={fused}")
+        if self.gpu_buffer is not None:
+            details.append(f"gpu_buffer_shape={tuple(self.gpu_buffer.shape)}")
+        return ", ".join(details)
 
     def to_gpu_310p(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
@@ -1058,6 +1104,8 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+        self._validate_memory_obj_shape(memory_obj, end - start)
+        logger.debug(self._format_transfer_debug_info("to_gpu", memory_obj, start, end))
 
         lmc_ops.multi_layer_kv_transfer(
             memory_obj.tensor,
@@ -1106,14 +1154,28 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
         if self.kv_format == KVCacheFormat.UNDEFINED:
             raise ValueError("KV cache format is not initialized!")
+        self._validate_memory_obj_shape(memory_obj, end - start)
 
         # Lazy initialize GPU buffer if needed
         if self.use_gpu and self.gpu_buffer is None:
             self._lazy_initialize_buffer(self.kvcaches)
 
+        use_fused_path = (
+            self.gpu_buffer is not None and end - start == self.gpu_buffer.shape[2]
+        )
+        logger.debug(
+            self._format_transfer_debug_info(
+                "from_gpu",
+                memory_obj,
+                start,
+                end,
+                fused=use_fused_path,
+            )
+        )
+
         with torch.cuda.stream(self.store_stream):
             # No staging buffer or token count mismatch
-            if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
+            if not use_fused_path:
                 lmc_ops.multi_layer_kv_transfer(
                     memory_obj.tensor,
                     kv_cache_pointers,
