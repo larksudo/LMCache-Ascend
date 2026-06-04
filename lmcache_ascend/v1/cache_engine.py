@@ -20,7 +20,13 @@ from lmcache.utils import (
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import (
+    MemoryAllocatorInterface,
+    MemoryFormat,
+    MemoryObj,
+    MemoryObjMetadata,
+    TensorMemoryObj,
+)
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.token_database import TokenDatabase
 import torch
@@ -62,6 +68,83 @@ class ThreadSafeEventList:
             except queue.Empty:
                 break
         return out
+
+
+class NPUBroadcastAllocator(MemoryAllocatorInterface):
+    """Allocator for passive-rank broadcast receive buffers on NPU.
+
+    Allocates NPU memory via :func:`torch.empty` and recycles it by
+    dropping the reference (no ``empty_cache`` call to avoid perf jitter).
+    This ensures that :meth:`TensorMemoryObj.ref_count_down` and
+    :meth:`TensorMemoryObj.__del__` can actually free the backing tensor
+    through the ``parent_allocator`` path, fixing the NPU-memory leak that
+    occurred when ``parent_allocator`` was ``None``.
+    """
+
+    def __init__(self, device: int) -> None:
+        self.device = device
+
+    def allocate(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        fmt: MemoryFormat = MemoryFormat.UNDEFINED,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[TensorMemoryObj]:
+        if isinstance(shapes, list):
+            shape = shapes[0]
+            dtype = dtypes[0]
+        else:
+            shape = shapes
+            dtype = dtypes
+        raw_tensor = torch.empty(
+            shape, dtype=dtype, device=f"npu:{self.device}"
+        )
+        metadata = MemoryObjMetadata(
+            shape=shape,
+            dtype=dtype,
+            address=0,
+            phy_size=shape.numel() * dtype.itemsize,
+            ref_count=1,
+            pin_count=0,
+            fmt=fmt,
+        )
+        return TensorMemoryObj(
+            raw_data=raw_tensor,
+            metadata=metadata,
+            parent_allocator=self,
+        )
+
+    def free(
+        self,
+        memory_obj: MemoryObj,
+        allocator_type: Optional[str] = None,
+    ) -> None:
+        if isinstance(memory_obj, TensorMemoryObj):
+            memory_obj.raw_data = None
+        memory_obj.invalidate()
+
+    def batched_allocate(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.UNDEFINED,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[list[TensorMemoryObj]]:
+        return None
+
+    def batched_free(
+        self,
+        memory_objs: list[MemoryObj],
+        allocator_type: Optional[str] = None,
+        update_stats: bool = True,
+    ) -> None:
+        for obj in memory_objs:
+            self.free(obj, allocator_type)
+
+    def close(self) -> None:
+        pass
 
 
 class AscendLMCacheEngine(LMCacheEngine):
@@ -107,8 +190,87 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         self._device_id: Optional[int] = None
 
+        # Broadcast allocator for passive ranks (save_only_first_rank).
+        # Initialised in ``post_init`` once the parallel topology is known.
+        self._broadcast_allocator: Optional[NPUBroadcastAllocator] = None
+
         if self.kv_events_enabled and self.is_store_async:
             self.kv_events = ThreadSafeEventList()
+
+    def _broadcast_or_receive_memory_objs(
+        self,
+        reordered_chunks: list,
+        ret_mask: torch.Tensor,
+    ) -> None:
+        """Broadcast or receive memory objects across NPU ranks.
+
+        Rank 0 (sender)  – broadcasts all chunk metadata and tensor data.
+        Passive ranks (receivers) – receive all metadata, allocate via
+        :class:`NPUBroadcastAllocator`, receive broadcast, and construct
+        ``TensorMemoryObj`` instances whose ``parent_allocator`` is wired
+        so that ``ref_count_down`` / ``__del__`` actually free the NPU
+        memory.
+
+        The HCCL call sequence is kept identical on every rank at all times:
+        if rank 0 cannot proceed it sends ``None`` as the chunk count and
+        **both** sides return before any tensor broadcast.
+        """
+        worker_id = self.metadata.worker_id
+
+        if self.metadata.is_first_rank():
+            # ---- Sender path (rank 0) ----
+            chunk_count = len(reordered_chunks)
+            self.broadcast_object_fn(chunk_count, self.metadata.first_rank)
+
+            for key, memory_obj, start, end in reordered_chunks:
+                metadata_dict = memory_obj.metadata.to_dict()
+                combined = (start, end, metadata_dict)
+                self.broadcast_object_fn(combined, self.metadata.first_rank)
+
+                raw_tensor = memory_obj.raw_tensor
+                assert raw_tensor is not None
+                tensor_to_broadcast = raw_tensor.to(f"npu:{worker_id}")
+                self.broadcast_fn(tensor_to_broadcast, self.metadata.first_rank)
+                del tensor_to_broadcast
+        else:
+            # ---- Receiver path (passive ranks) ----
+            local_rank = worker_id % torch.npu.device_count()
+            allocator = self._broadcast_allocator
+            assert allocator is not None, (
+                "_broadcast_allocator must be initialised on passive ranks "
+                "in post_init"
+            )
+
+            chunk_count = self.broadcast_object_fn(None, self.metadata.first_rank)
+            if chunk_count is None:
+                logger.warning(
+                    "rank=%s received None chunk_count from rank 0; "
+                    "skipping broadcast",
+                    worker_id,
+                )
+                return
+
+            for _ in range(chunk_count):
+                combined = self.broadcast_object_fn(
+                    None, self.metadata.first_rank
+                )
+                if combined is None:
+                    logger.warning(
+                        "rank=%s received None metadata in chunk loop; "
+                        "skipping remaining chunks",
+                        worker_id,
+                    )
+                    break
+                start, end, metadata_dict = combined
+                ret_mask[start:end] = True
+                metadata = MemoryObjMetadata.from_dict(metadata_dict)
+
+                memory_obj = allocator.allocate(
+                    torch.Size([metadata.get_size()]), torch.uint8
+                )
+                assert memory_obj is not None
+                self.broadcast_fn(memory_obj.raw_data, self.metadata.first_rank)
+                reordered_chunks.append((None, memory_obj, start, end))
 
     def _ensure_store_worker(self) -> None:
         if self._store_queue is not None:
@@ -131,6 +293,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "Ascend async store queue initialized: mode=%s maxsize=%d",
                 queue_mode,
                 self._store_queue_maxsize,
+            )
+
+        if self._is_passive():
+            local_rank = self.metadata.worker_id % torch.npu.device_count()
+            self._broadcast_allocator = NPUBroadcastAllocator(local_rank)
+            logger.info(
+                "rank=%s is passive; NPUBroadcastAllocator initialised on npu:%d",
+                self.metadata.worker_id,
+                local_rank,
             )
 
     def _store_worker_loop(self) -> None:
@@ -588,5 +759,8 @@ class AscendLMCacheEngine(LMCacheEngine):
                         )
             except Exception:
                 logger.exception("Error stopping Ascend store worker")
+
+        if self._broadcast_allocator is not None:
+            self._broadcast_allocator.close()
 
         super().close()
