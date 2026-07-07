@@ -102,10 +102,11 @@ void compute_multi_layer_ub_params(MultiLayerKVConfig &config,
   // per loop
   int64_t max_hidden_dims = config.hidden_dims;
   if (config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV) {
-    max_hidden_dims = std::max(config.k_hidden_dims, config.v_hidden_dims);
+    // Fused path: UB buffer holds K+V concatenated per token (512+64=576)
+    max_hidden_dims = config.k_hidden_dims + config.v_hidden_dims;
   } else if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
-    max_hidden_dims = std::max(
-        {config.k_hidden_dims, config.v_hidden_dims, config.dsa_hidden_dims});
+    // Fused path: UB buffer holds K+V+DSA_K concatenated per token (512+64+128=704)
+    max_hidden_dims = config.k_hidden_dims + config.v_hidden_dims + config.dsa_hidden_dims;
   }
 
   int64_t baseBuffSize =
