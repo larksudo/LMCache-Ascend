@@ -66,17 +66,6 @@ public:
         }
     }
 
-    // For MLA_KV and DSA_KV: total fused hidden dims (K + V [+ DSA_K])
-    __aicore__ inline int64_t GetFusedHiddenDims() {
-        if constexpr (kvcache_fmt == kvcache_ops::KVCacheFormat::MLA_KV) {
-            return this->kHiddenDims_ + this->vHiddenDims_;
-        } else if constexpr (kvcache_fmt == kvcache_ops::KVCacheFormat::DSA_KV) {
-            return this->kHiddenDims_ + this->vHiddenDims_ + this->dsaHiddenDims_;
-        } else {
-            return this->hiddenDims_;
-        }
-    }
-
     __aicore__ inline int64_t GetLMCBaseOffset(const int cacheIdx) {
         if constexpr (kvcache_fmt == kvcache_ops::KVCacheFormat::MLA_KV) {
             if (cacheIdx == 0) return 0;
@@ -88,115 +77,6 @@ public:
         } else {
             return static_cast<int64_t>(cacheIdx) * this->numLayers_ * this->numTokensChunk_ * this->hiddenDims_;
         }
-    }
-
-    // Fused page2L transfer: read all planes into one contiguous UB buffer,
-    // then write back to LMC with a single DataCopy.
-    // Eliminates per-plane UB alloc/free cycles and reduces GM write count.
-    __aicore__ inline void _page2LTransferFused(__gm__ uint8_t *pagedKVCaches,
-                                                __gm__ uint8_t* /*cacheTensor*/,
-                                                __gm__ uint8_t *slotmappings,
-                                                const int layerIdx, const int32_t startTokensIdx,
-                                                const int32_t endTokensIdx,
-                                                const int32_t actualTokensPerInnerLoop)
-    {
-        __gm__ slot_t *slotmappingPtr = reinterpret_cast<__gm__ slot_t*>(slotmappings);
-
-        const int64_t fusedDims = GetFusedHiddenDims();
-
-        // Get GM base pointers for each plane of this layer
-        constexpr int32_t numPlanes = (kvcache_fmt == kvcache_ops::KVCacheFormat::DSA_KV) ? 3 : 2;
-        __gm__ uint8_t* planeBasePtrs[numPlanes];
-        int64_t planeDims[numPlanes];
-        for (int32_t p = 0; p < numPlanes; p++) {
-            planeBasePtrs[p] = kvcache_ops::GetLayerBasePtr<kvcache_fmt>(pagedKVCaches, layerIdx, p);
-            planeDims[p] = GetHiddenDims(p);
-        }
-
-        // 1. alloc fused UB buffer
-        local_scalar_t fusedBuffer = this->pagedTokenQue_.template AllocTensor<scalar_t>();
-
-        // 2. for each token, read each plane into the contiguous UB region
-        int64_t slot;
-        int64_t ubTokenBase;
-        for (int64_t tokenIdx = startTokensIdx; tokenIdx < endTokensIdx; tokenIdx++) {
-            slot = static_cast<int64_t>(slotmappingPtr[tokenIdx]);
-            ubTokenBase = (tokenIdx - startTokensIdx) * fusedDims;
-
-            int64_t ubOffset = ubTokenBase;
-            for (int32_t p = 0; p < numPlanes; p++) {
-                __gm__ scalar_t* planeGM = reinterpret_cast<__gm__ scalar_t*>(planeBasePtrs[p]);
-                AscendC::DataCopy(fusedBuffer[ubOffset], planeGM[slot * planeDims[p]], planeDims[p]);
-                ubOffset += planeDims[p];
-            }
-        }
-
-        // 3. enque & deque
-        pagedTokenQue_.EnQue(fusedBuffer);
-        fusedBuffer = pagedTokenQue_.DeQue<scalar_t>();
-
-        // 4. single fused write to LMC buffer (contiguous)
-        int64_t lmcOffset = static_cast<int64_t>(layerIdx) * this->numTokensChunk_ * fusedDims
-                          + static_cast<int64_t>(startTokensIdx) * fusedDims;
-        AscendC::DataCopy(this->lmcBufferGlobal_[lmcOffset], fusedBuffer,
-                          actualTokensPerInnerLoop * fusedDims);
-
-        // 5. Free
-        pagedTokenQue_.FreeTensor(fusedBuffer);
-    }
-
-    // Fused L2Page transfer: read entire fused token data from LMC in one DataCopy,
-    // then scatter to each plane's paged KV cache.
-    __aicore__ inline void _L2PageTransferFused(__gm__ uint8_t *pagedKVCaches,
-                                                __gm__ uint8_t* /*cacheTensor*/,
-                                                __gm__ uint8_t *slotmappings,
-                                                const int layerIdx, const int32_t startTokensIdx,
-                                                const int32_t endTokensIdx,
-                                                const int32_t actualTokensPerInnerLoop)
-    {
-        __gm__ slot_t *slotmappingPtr = reinterpret_cast<__gm__ slot_t*>(slotmappings);
-
-        const int64_t fusedDims = GetFusedHiddenDims();
-
-        // Get GM base pointers for each plane of this layer
-        constexpr int32_t numPlanes = (kvcache_fmt == kvcache_ops::KVCacheFormat::DSA_KV) ? 3 : 2;
-        __gm__ uint8_t* planeBasePtrs[numPlanes];
-        int64_t planeDims[numPlanes];
-        for (int32_t p = 0; p < numPlanes; p++) {
-            planeBasePtrs[p] = kvcache_ops::GetLayerBasePtr<kvcache_fmt>(pagedKVCaches, layerIdx, p);
-            planeDims[p] = GetHiddenDims(p);
-        }
-
-        // 1. alloc fused UB buffer
-        local_scalar_t fusedBuffer = this->pagedTokenQue_.template AllocTensor<scalar_t>();
-
-        // 2. single fused read from LMC buffer (contiguous)
-        int64_t lmcOffset = static_cast<int64_t>(layerIdx) * this->numTokensChunk_ * fusedDims
-                          + static_cast<int64_t>(startTokensIdx) * fusedDims;
-        AscendC::DataCopy(fusedBuffer, this->lmcBufferGlobal_[lmcOffset],
-                          actualTokensPerInnerLoop * fusedDims);
-
-        // 3. enque & deque
-        pagedTokenQue_.EnQue(fusedBuffer);
-        fusedBuffer = pagedTokenQue_.DeQue<scalar_t>();
-
-        // 4. for each token, scatter from UB to each plane's paged GM
-        int64_t slot;
-        int64_t ubTokenBase;
-        for (int64_t tokenIdx = startTokensIdx; tokenIdx < endTokensIdx; tokenIdx++) {
-            slot = static_cast<int64_t>(slotmappingPtr[tokenIdx]);
-            ubTokenBase = (tokenIdx - startTokensIdx) * fusedDims;
-
-            int64_t ubOffset = ubTokenBase;
-            for (int32_t p = 0; p < numPlanes; p++) {
-                __gm__ scalar_t* planeGM = reinterpret_cast<__gm__ scalar_t*>(planeBasePtrs[p]);
-                AscendC::DataCopy(planeGM[slot * planeDims[p]], fusedBuffer[ubOffset], planeDims[p]);
-                ubOffset += planeDims[p];
-            }
-        }
-
-        // 5. Free
-        pagedTokenQue_.FreeTensor(fusedBuffer);
     }
 
     __aicore__ inline void _page2LTransfer(__gm__ uint8_t *pagedKVCaches, __gm__ uint8_t* cacheTensor, 
@@ -284,37 +164,6 @@ public:
 
         // 5. free
         pagedTokenQue_.FreeTensor(perLayerSingleCacheBuffer);
-    }
-
-    // Fused processLayerCache for MLA_KV/DSA_KV: processes all planes in one pass,
-    // reading each plane into a contiguous UB buffer then doing a single GM write.
-    __aicore__ inline void processLayerCacheFused(__gm__ uint8_t *pagedKVCaches, __gm__ uint8_t* cacheTensor,
-                                                  __gm__ uint8_t *slotmappings, const int layerIdx,
-                                                  const bool page2L)
-    {
-        const int64_t fusedDims = GetFusedHiddenDims();
-
-        // Set up LMC global buffer pointing to the fused contiguous region
-        this->lmcBufferGlobal_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t*>(cacheTensor),
-                                               this->numTokensChunk_ * fusedDims);
-
-        int32_t startTokensIdx;
-        int32_t endTokensIdx;
-        int32_t actualTokensPerInnerLoop;
-
-        for (startTokensIdx = 0; startTokensIdx < this->numTokensChunk_; startTokensIdx += this->maxTokensPerLoop_) {
-            endTokensIdx = startTokensIdx + this->maxTokensPerLoop_;
-            endTokensIdx = min(endTokensIdx, this->numTokensChunk_);
-            actualTokensPerInnerLoop = endTokensIdx - startTokensIdx;
-
-            if (page2L) {
-                this->_page2LTransferFused(pagedKVCaches, cacheTensor, slotmappings, layerIdx,
-                                           startTokensIdx, endTokensIdx, actualTokensPerInnerLoop);
-            } else {
-                this->_L2PageTransferFused(pagedKVCaches, cacheTensor, slotmappings, layerIdx,
-                                           startTokensIdx, endTokensIdx, actualTokensPerInnerLoop);
-            }
-        }
     }
 
     __aicore__ inline void processLayerCache(__gm__ uint8_t *pagedKVCaches, __gm__ uint8_t* cacheTensor, 
@@ -408,15 +257,8 @@ private:
                 numLayers, pageBuffSize, numTokensChunk, perLoopBuffer, maxTokensPerLoop, page2L, &pipe, \
                 kHiddenDims, vHiddenDims, dsaHiddenDims);                                               \
         for (int32_t layerIdx = startLayersIdx; layerIdx < endLayersIdx; layerIdx++) {                  \
-            if constexpr (kvcache_ops::KVCacheFormat::FMT == kvcache_ops::KVCacheFormat::MLA_KV ||      \
-                          kvcache_ops::KVCacheFormat::FMT == kvcache_ops::KVCacheFormat::DSA_KV) {      \
-                /* Fused path: process all planes in one pass */                                        \
-                op.processLayerCacheFused(pagedKVCaches, dstCacheTensor, slotmappings, layerIdx, page2L); \
-            } else {                                                                                    \
-                /* Standard path: per-plane loop */                                                     \
-                for (int32_t cacheIdx = 0; cacheIdx < kvs; cacheIdx++) {                                \
-                    op.processLayerCache(pagedKVCaches, dstCacheTensor, slotmappings, cacheIdx, layerIdx, page2L); \
-                }                                                                                       \
+            for (int32_t cacheIdx = 0; cacheIdx < kvs; cacheIdx++) {                                    \
+                op.processLayerCache(pagedKVCaches, dstCacheTensor, slotmappings, cacheIdx, layerIdx, page2L); \
             }                                                                                           \
         }                                                                                               \
     }

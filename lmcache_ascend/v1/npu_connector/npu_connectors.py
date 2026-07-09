@@ -1135,8 +1135,11 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
 
         self.kv_format: KVCacheFormat = KVCacheFormat.UNDEFINED
 
-        # layerwise mode currently does not support MLA
+        # MLA/DSA attributes (initialized in _lazy_initialize_buffer)
         self.use_mla = kwargs.get("use_mla", False)
+        self.kv_lora_rank: int = 0
+        self.qk_rope_head_dim: int = 0
+        self.dsa_head_dim: int = 0
 
     def _lazy_initialize_buffer(self, kv_caches):
         """
@@ -1149,6 +1152,8 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         - Legacy MERGED_KV: [2, num_blocks, block_size, num_heads, head_size]
         - New SEPARATE_KV: tuple(key_tensor, value_tensor) where each is
           [num_blocks, block_size, num_heads, head_size]
+        - MLA_KV: tuple(k_cache, v_cache) with different last-dim sizes
+        - DSA_KV: tuple(k_cache, v_cache, dsa_k_cache)
         """
         if self.use_gpu and self.gpu_buffer_allocator is None:
             logger.info("Lazily initializing GPU buffer.")
@@ -1195,6 +1200,35 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 else:
                     # Flash Infer: [num_blocks, 2, block_size, num_heads, head_size]
                     k_cache_shape_per_layer = first_layer_cache[:, 0].shape
+
+            elif self.kv_format == KVCacheFormat.MLA_KV:
+                # MLA: tuple(k_cache, v_cache)
+                # k_cache: [num_blocks, block_size, num_kv_heads, kv_lora_rank]
+                # v_cache: [num_blocks, block_size, num_kv_heads, qk_rope_head_dim]
+                k_cache, v_cache = first_layer_cache
+                self.vllm_two_major = False
+                self.kv_lora_rank = k_cache.shape[-1]
+                self.qk_rope_head_dim = v_cache.shape[-1]
+                k_cache_shape_per_layer = k_cache.shape
+                logger.info(
+                    f"MLA detected: kv_lora_rank={self.kv_lora_rank}, "
+                    f"qk_rope_head_dim={self.qk_rope_head_dim}"
+                )
+
+            elif self.kv_format == KVCacheFormat.DSA_KV:
+                # DSA: tuple(k_cache, v_cache, dsa_k_cache)
+                k_cache, v_cache, dsa_k_cache = first_layer_cache
+                self.vllm_two_major = False
+                self.kv_lora_rank = k_cache.shape[-1]
+                self.qk_rope_head_dim = v_cache.shape[-1]
+                self.dsa_head_dim = dsa_k_cache.shape[-1]
+                k_cache_shape_per_layer = k_cache.shape
+                logger.info(
+                    f"DSA detected: kv_lora_rank={self.kv_lora_rank}, "
+                    f"qk_rope_head_dim={self.qk_rope_head_dim}, "
+                    f"dsa_head_dim={self.dsa_head_dim}"
+                )
+
             else:
                 raise ValueError(f"Unsupported KV cache format: {self.kv_format}")
 
@@ -1207,13 +1241,44 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                 f"  - Max tokens: {max_tokens}"
             )
 
-            num_elements_key = k_cache_shape_per_layer.numel()
-            num_elements = num_elements_key * 2
+            if self.kv_format in (KVCacheFormat.MLA_KV, KVCacheFormat.DSA_KV):
+                # MLA/DSA: memobj is [num_tokens, k_hidden + v_hidden (+dsa_hidden)]
+                # single plane, no kv_size multiplier
+                if self.kv_format == KVCacheFormat.MLA_KV:
+                    total_hidden = self.kv_lora_rank + self.qk_rope_head_dim
+                else:
+                    total_hidden = (
+                        self.kv_lora_rank
+                        + self.qk_rope_head_dim
+                        + self.dsa_head_dim
+                    )
+                num_elements = max_tokens * total_hidden
+            else:
+                num_elements_key = k_cache_shape_per_layer.numel()
+                num_elements = num_elements_key * 2
             gpu_buffer_size = num_elements * self.element_size
 
             self.gpu_buffer_allocator = GPUMemoryAllocator(
                 gpu_buffer_size, device=self.device
             )
+
+    def get_shape(self, num_tokens: int) -> torch.Size:
+        """Override to return correct shape for MLA/DSA formats.
+
+        MLA/DSA memobj is 2D: [num_tokens, k_hidden + v_hidden (+dsa_hidden)]
+        K and V are concatenated per-token (matching LMCache GPU's token-major layout).
+        """
+        if self.kv_format == KVCacheFormat.MLA_KV:
+            total_hidden = self.kv_lora_rank + self.qk_rope_head_dim
+            return torch.Size([num_tokens, total_hidden])
+        elif self.kv_format == KVCacheFormat.DSA_KV:
+            total_hidden = (
+                self.kv_lora_rank + self.qk_rope_head_dim + self.dsa_head_dim
+            )
+            return torch.Size([num_tokens, total_hidden])
+        else:
+            # Standard format: [num_tokens, 2, hidden_dim_size]
+            return torch.Size([num_tokens, 2, self.hidden_dim_size])
 
     def batched_to_gpu(self, starts: List[int], ends: List[int], **kwargs):
         """
@@ -1274,8 +1339,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if self.use_gpu:
             buffer_shape = self.get_shape(num_tokens)
             assert self.gpu_buffer_allocator is not None
+            buffer_fmt = (
+                MemoryFormat.KV_MLA_FMT
+                if self.kv_format in (KVCacheFormat.MLA_KV, KVCacheFormat.DSA_KV)
+                else MemoryFormat.KV_T2D
+            )
             tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-                buffer_shape, self.dtype, MemoryFormat.KV_T2D
+                buffer_shape, self.dtype, buffer_fmt
             )
             assert tmp_gpu_buffer_obj is not None, (
                 "Failed to allocate NPU buffer in NPUConnector"
@@ -1296,7 +1366,10 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                     cpu_tensors = []
                     for memory_obj in memory_objs_layer:
                         assert memory_obj.tensor is not None
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
+                        if self.kv_format in (KVCacheFormat.MLA_KV, KVCacheFormat.DSA_KV):
+                            assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT
+                        else:
+                            assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
                         cpu_tensors.append(memory_obj.tensor)
 
                     # Fused transfer: N H2D memcpy + 1 scatter kernel
@@ -1308,7 +1381,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         chunk_offsets,  # offset for each chunk
                         chunk_sizes,  # size for each chunk
                         False,  # to_gpu
-                        self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
+                        self.kv_format.value,  # 1:MERGED / 2:SEPARATE / 3:MLA / 4:DSA
                         True,  # token_major
                         self.vllm_two_major,
                     )
@@ -1324,7 +1397,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             self.kvcaches[layer_id],
                             slot_mapping[start:end],
                             False,
-                            self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
+                            self.kv_format.value,  # 1:MERGED / 2:SEPARATE / 3:MLA / 4:DSA
                             True,
                             self.vllm_two_major,
                         )
@@ -1409,8 +1482,13 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
         if self.use_gpu:
             buffer_shape = self.get_shape(num_tokens)
             assert self.gpu_buffer_allocator is not None
+            buffer_fmt = (
+                MemoryFormat.KV_MLA_FMT
+                if self.kv_format in (KVCacheFormat.MLA_KV, KVCacheFormat.DSA_KV)
+                else MemoryFormat.KV_T2D
+            )
             tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-                buffer_shape, self.dtype, MemoryFormat.KV_T2D
+                buffer_shape, self.dtype, buffer_fmt
             )
             assert tmp_gpu_buffer_obj is not None, (
                 "Failed to allocate NPU buffer in NPUConnector"
@@ -1440,7 +1518,7 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                         chunk_offsets,
                         chunk_sizes,
                         True,  # from_gpu
-                        self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
+                        self.kv_format.value,  # 1:MERGED / 2:SEPARATE / 3:MLA / 4:DSA
                         True,  # token_major
                         self.vllm_two_major,
                     )
@@ -1455,10 +1533,16 @@ class VLLMPagedMemLayerwiseNPUConnector(VLLMPagedMemLayerwiseGPUConnector):
                             self.kvcaches[layer_id],
                             slot_mapping[start:end],
                             True,
-                            self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
+                            self.kv_format.value,  # 1:MERGED / 2:SEPARATE / 3:MLA / 4:DSA
                             True,
                             self.vllm_two_major,
                         )
+
+                # Set memory_obj format for MLA/DSA
+                if self.kv_format in (KVCacheFormat.MLA_KV, KVCacheFormat.DSA_KV):
+                    for memory_obj in memory_objs_layer:
+                        memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+
                 logger.debug(f"Finished offloading layer {layer_id}")
             yield
 
@@ -1750,4 +1834,20 @@ class SGLangLayerwiseNPUConnector(SGLangLayerwiseGPUConnector):
         yield
 
     def get_shape(self, num_tokens: int) -> torch.Size:
-        return torch.Size([num_tokens, 2, self.hidden_dim_size])
+        if self.kv_format == KVCacheFormat.MLA_KV:
+            # MLA: [num_tokens, kv_lora_rank + qk_rope_head_dim]
+            return torch.Size(
+                [num_tokens, self.kv_lora_rank + self.qk_rope_head_dim]
+            )
+        elif self.kv_format == KVCacheFormat.DSA_KV:
+            # DSA: [num_tokens, kv_lora_rank + qk_rope_head_dim + dsa_head_dim]
+            return torch.Size(
+                [
+                    num_tokens,
+                    self.kv_lora_rank
+                    + self.qk_rope_head_dim
+                    + self.dsa_head_dim,
+                ]
+            )
+        else:
+            return torch.Size([num_tokens, 2, self.hidden_dim_size])

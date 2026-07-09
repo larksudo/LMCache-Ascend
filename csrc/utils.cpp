@@ -102,11 +102,10 @@ void compute_multi_layer_ub_params(MultiLayerKVConfig &config,
   // per loop
   int64_t max_hidden_dims = config.hidden_dims;
   if (config.kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV) {
-    // Fused path: UB buffer holds K+V concatenated per token (512+64=576)
-    max_hidden_dims = config.k_hidden_dims + config.v_hidden_dims;
+    max_hidden_dims = std::max(config.k_hidden_dims, config.v_hidden_dims);
   } else if (config.kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
-    // Fused path: UB buffer holds K+V+DSA_K concatenated per token (512+64+128=704)
-    max_hidden_dims = config.k_hidden_dims + config.v_hidden_dims + config.dsa_hidden_dims;
+    max_hidden_dims = std::max(
+        {config.k_hidden_dims, config.v_hidden_dims, config.dsa_hidden_dims});
   }
 
   int64_t baseBuffSize =
@@ -147,9 +146,11 @@ void compute_multi_layer_ub_params(MultiLayerKVConfig &config,
   config.singlePerLoopBuffer = totalPerLoopBuffer / numBuffsOnDev;
 }
 
-void compute_single_layer_ub_params(const KVTransferDims &dims,
-                                    KVTransferUBParams &ub_params,
-                                    const torch::Tensor &vllm_cache) {
+void compute_single_layer_ub_params(
+    const KVTransferDims &dims, KVTransferUBParams &ub_params,
+    const torch::Tensor &vllm_cache,
+    kvcache_ops::KVCacheFormat kvcache_format,
+    int64_t v_hidden_dims, int64_t dsa_hidden_dims) {
 
   const c10::OptionalDeviceGuard device_guard(device_of(vllm_cache));
 
@@ -164,9 +165,23 @@ void compute_single_layer_ub_params(const KVTransferDims &dims,
   ub_params.aiv_num = static_cast<uint32_t>(std::min(4, dims.num_tokens));
 
   uint32_t numBuffsOnDev = 2;
-  // each token buffer is kv * heads * headdims * size
-  uint64_t baseBuffSize = numBuffsOnDev * dims.kv_size * dims.num_heads *
-                          dims.head_dims * vllm_cache.element_size();
+  // Per-token buffer size computation:
+  // - MERGED/SEPARATE: kv_size * heads * head_dims (K and V same dims)
+  // - MLA: heads * (k_hidden + v_hidden) (per-token concatenated, kv_size=1)
+  // - DSA: heads * (k_hidden + v_hidden + dsa_hidden) (per-token concatenated, kv_size=1)
+  uint64_t perTokenElements;
+  if (kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV) {
+    perTokenElements = static_cast<uint64_t>(dims.num_heads) *
+                       (dims.head_dims + v_hidden_dims);
+  } else if (kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+    perTokenElements = static_cast<uint64_t>(dims.num_heads) *
+                       (dims.head_dims + v_hidden_dims + dsa_hidden_dims);
+  } else {
+    perTokenElements = static_cast<uint64_t>(dims.kv_size) *
+                       dims.num_heads * dims.head_dims;
+  }
+  uint64_t baseBuffSize = numBuffsOnDev * perTokenElements *
+                          vllm_cache.element_size();
 
   if (ubSize < baseBuffSize) {
     std::string errStr =
@@ -187,23 +202,36 @@ void compute_single_layer_strides(
     const KVTransferDims &dims, KVTransferStrides &strides,
     const torch::Tensor &lmc_cache,
     const torch::Tensor &vllm_k_cache, // for merged
-    bool token_major, bool vllm_two_major, bool is_separate,
-    const torch::Tensor *vllm_v_cache) { // for separate
+    bool token_major, bool vllm_two_major,
+    bool use_separate_tensors, // true for SEPARATE_KV, MLA_KV, DSA_KV
+    const torch::Tensor *vllm_v_cache, // for separate
+    bool is_mla, int64_t k_hidden_dims, int64_t v_hidden_dims,
+    bool is_dsa, int64_t dsa_hidden_dims,
+    const torch::Tensor *vllm_dsa_cache) {
 
   // LMC strides
-  if (token_major) {
+  if (is_mla || is_dsa) {
+    // MLA/DSA memobj: [num_tokens, k_hidden + v_hidden (+dsa_hidden)] (2D)
+    // K and V are concatenated in the last dim
+    strides.lmc_token_stride = lmc_cache.stride(0);
+    strides.lmc_val_offset = k_hidden_dims;
+    // lmc_dsa_offset only meaningful for DSA; MLA has no 3rd tensor
+    strides.lmc_dsa_offset = is_dsa ? (k_hidden_dims + v_hidden_dims) : 0;
+  } else if (token_major) {
     // Shape: [tokens, 2, heads*headdim]
     strides.lmc_token_stride = lmc_cache.stride(0);
     strides.lmc_val_offset = lmc_cache.stride(1);
+    strides.lmc_dsa_offset = 0;
   } else {
     // Shape: [2, tokens, heads*headdim]
     strides.lmc_token_stride = lmc_cache.stride(1);
     strides.lmc_val_offset = lmc_cache.stride(0);
+    strides.lmc_dsa_offset = 0;
   }
   strides.lmc_bytes = static_cast<int64_t>(lmc_cache.nbytes());
 
   // vLLM buffer strides
-  if (!is_separate) {
+  if (!use_separate_tensors) {
     if (vllm_two_major) {
       // Shape: [2, num_blocks, block_size, heads, head_dims]
       strides.vllm_k_stride = vllm_k_cache.stride(1);   // Block stride
@@ -218,11 +246,13 @@ void compute_single_layer_strides(
     // only for separate
     strides.vllm_v_stride = 0;
     strides.vllm_v_bytes = 0;
+    strides.vllm_dsa_stride = 0;
+    strides.vllm_dsa_bytes = 0;
 
   } else {
-    // SEPARATE
+    // SEPARATE_KV, MLA_KV, DSA_KV: K and V (and DSA) in different tensors
     TORCH_CHECK(vllm_v_cache != nullptr,
-                "vllm_v_cache required for SEPARATE format");
+                "vllm_v_cache required for SEPARATE/MLA/DSA format");
 
     // Shape: [num_blocks, block_size, heads, head_dims]
     strides.vllm_k_stride = vllm_k_cache.stride(0);
@@ -230,6 +260,15 @@ void compute_single_layer_strides(
 
     strides.vllm_k_bytes = static_cast<int64_t>(vllm_k_cache.nbytes());
     strides.vllm_v_bytes = static_cast<int64_t>(vllm_v_cache->nbytes());
+
+    // DSA 3rd tensor (if present)
+    if (is_dsa && vllm_dsa_cache != nullptr) {
+      strides.vllm_dsa_stride = vllm_dsa_cache->stride(0);
+      strides.vllm_dsa_bytes = static_cast<int64_t>(vllm_dsa_cache->nbytes());
+    } else {
+      strides.vllm_dsa_stride = 0;
+      strides.vllm_dsa_bytes = 0;
+    }
 
     // only for merged
     strides.vllm_val_offset = 0;
@@ -239,19 +278,58 @@ void compute_single_layer_strides(
 SingleLayerKVConfig prepare_single_layer_kv_config(
     torch::Tensor &lmc_dst_cache, std::vector<torch::Tensor> &vllm_kv_caches,
     torch::Tensor &slot_mapping, bool direction, bool token_major,
-    bool vllm_two_major, bool is_separate) {
+    bool vllm_two_major,
+    bool use_separate_tensors, // true for SEPARATE_KV, MLA_KV, DSA_KV
+    kvcache_ops::KVCacheFormat kvcache_format,
+    int64_t k_hidden_dims, int64_t v_hidden_dims,
+    int64_t dsa_hidden_dims) {
 
   SingleLayerKVConfig config;
 
   torch::Tensor &vllm_k_cache = vllm_kv_caches[0];
-  torch::Tensor *vllm_v_cache = is_separate ? &vllm_kv_caches[1] : nullptr;
+  torch::Tensor *vllm_v_cache = use_separate_tensors ? &vllm_kv_caches[1] : nullptr;
+
+  bool is_mla = (kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV);
+  bool is_dsa = (kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV);
+
+  // For MLA/DSA, vllm_v_cache is also a separate tensor
+  torch::Tensor *vllm_dsa_cache = nullptr;
+  if (is_mla || is_dsa) {
+    vllm_v_cache = &vllm_kv_caches[1];
+  }
+  if (is_dsa && vllm_kv_caches.size() >= 3) {
+    vllm_dsa_cache = &vllm_kv_caches[2];
+  }
 
   // Dims
   config.dims.num_tokens = slot_mapping.size(0);
   config.dims.num_heads = vllm_k_cache.size(-2);
-  config.dims.head_dims = vllm_k_cache.size(-1);
   config.dims.block_size = vllm_k_cache.size(-3);
-  config.dims.kv_size = 2;
+
+  if (is_mla) {
+    // MLA memobj: [num_tokens, k_hidden + v_hidden] (per-token concatenated)
+    // k_hidden = kv_lora_rank (512), v_hidden = qk_rope_head_dim (64)
+    config.dims.kv_size = 2;
+    config.dims.head_dims = k_hidden_dims;  // used as primary head_dim
+    config.kvcache_format = kvcache_format;
+    config.k_hidden_dims = k_hidden_dims;
+    config.v_hidden_dims = v_hidden_dims;
+    config.dsa_hidden_dims = 0;
+  } else if (is_dsa) {
+    config.dims.kv_size = 3;
+    config.dims.head_dims = k_hidden_dims;
+    config.kvcache_format = kvcache_format;
+    config.k_hidden_dims = k_hidden_dims;
+    config.v_hidden_dims = v_hidden_dims;
+    config.dsa_hidden_dims = dsa_hidden_dims;
+  } else {
+    config.dims.kv_size = 2;
+    config.dims.head_dims = vllm_k_cache.size(-1);
+    config.kvcache_format = kvcache_format;
+    config.k_hidden_dims = 0;
+    config.v_hidden_dims = 0;
+    config.dsa_hidden_dims = 0;
+  }
 
   // ptrs
   config.ptrs.lmc_ptr =
@@ -268,6 +346,13 @@ SingleLayerKVConfig prepare_single_layer_kv_config(
     config.ptrs.vllm_v_ptr = nullptr;
   }
 
+  if (vllm_dsa_cache != nullptr) {
+    config.ptrs.vllm_dsa_ptr =
+        get_kernel_ptr<uint8_t, const torch::Tensor>(*vllm_dsa_cache);
+  } else {
+    config.ptrs.vllm_dsa_ptr = nullptr;
+  }
+
   config.ub_params.scalar_type_num =
       vllm_ascend::get_dtype_from_torch(vllm_k_cache.scalar_type());
   config.ub_params.slot_type_num =
@@ -276,25 +361,17 @@ SingleLayerKVConfig prepare_single_layer_kv_config(
   config.direction = direction;
   config.token_major = token_major;
 
-  // MLA
-  bool is_mla = false;
-  if (token_major) {
-    is_mla = lmc_dst_cache.size(1) == 1; // [tokens, 1, hidden]
-  } else {
-    is_mla = lmc_dst_cache.size(0) == 1; // [1, tokens, hidden]
-  }
-  if (is_mla) {
-    PyErr_SetString(PyExc_RuntimeError, "MLA is not supported yet.");
-    throw py::error_already_set();
-  }
-
   // Compute UB Params
-  compute_single_layer_ub_params(config.dims, config.ub_params, vllm_k_cache);
+  compute_single_layer_ub_params(config.dims, config.ub_params, vllm_k_cache,
+                                 kvcache_format, v_hidden_dims,
+                                 dsa_hidden_dims);
 
   // Compute Strides
   compute_single_layer_strides(config.dims, config.strides, lmc_dst_cache,
                                vllm_k_cache, token_major, vllm_two_major,
-                               is_separate, vllm_v_cache);
+                               use_separate_tensors, vllm_v_cache,
+                               is_mla || is_dsa, k_hidden_dims, v_hidden_dims,
+                               is_dsa, dsa_hidden_dims, vllm_dsa_cache);
 
   return config;
 }
@@ -382,11 +459,14 @@ bool validate_vllm_caches(const std::vector<torch::Tensor> &vllm_kv_caches,
   kvcache_ops::KVCacheFormat format =
       static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw);
   bool is_separate = (format == kvcache_ops::KVCacheFormat::SEPARATE_KV);
+  bool is_mla = (format == kvcache_ops::KVCacheFormat::MLA_KV);
+  bool is_dsa = (format == kvcache_ops::KVCacheFormat::DSA_KV);
 
-  if (!is_separate && format != kvcache_ops::KVCacheFormat::MERGED_KV) {
+  if (!is_separate && !is_mla && !is_dsa &&
+      format != kvcache_ops::KVCacheFormat::MERGED_KV) {
     std::string err =
         "Invalid KV cache format: " + std::to_string(kvcache_format_raw) +
-        ". Expected 1 (MERGED_KV) or 2 (SEPARATE_KV)";
+        ". Expected 1 (MERGED_KV), 2 (SEPARATE_KV), 3 (MLA_KV) or 4 (DSA_KV)";
     PyErr_SetString(PyExc_ValueError, err.c_str());
     throw py::error_already_set();
   }
@@ -404,6 +484,27 @@ bool validate_vllm_caches(const std::vector<torch::Tensor> &vllm_kv_caches,
     }
     if (vllm_kv_caches[0].sizes() != vllm_kv_caches[1].sizes()) {
       throw py::value_error("K and V caches must have the same shape.");
+    }
+  } else if (is_mla) {
+    // MLA: tuple(k_cache, v_cache) with different last-dim sizes
+    if (vllm_kv_caches.size() != 2) {
+      PyErr_SetString(PyExc_ValueError,
+                      "MLA_KV expects 2 tensors (k_cache and v_cache).");
+      throw py::error_already_set();
+    }
+    // K and V have different last-dim sizes (kv_lora_rank vs qk_rope_head_dim)
+    // but same other dims
+    if (vllm_kv_caches[0].sizes() == vllm_kv_caches[1].sizes()) {
+      // If shapes are identical, it's not really MLA (should be SEPARATE_KV)
+      std::cerr << "Warning: MLA_KV detected but K and V have identical "
+                   "shapes. This might be a misconfiguration.\n";
+    }
+  } else if (is_dsa) {
+    // DSA: tuple(k_cache, v_cache, dsa_k_cache)
+    if (vllm_kv_caches.size() != 3) {
+      PyErr_SetString(PyExc_ValueError,
+                      "DSA_KV expects 3 tensors (k_cache, v_cache, dsa_k_cache).");
+      throw py::error_already_set();
     }
   } else {
     if (vllm_kv_caches.size() != 1) {

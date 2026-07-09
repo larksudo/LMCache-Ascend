@@ -47,12 +47,18 @@ void single_layer_kv_transfer_kernel_v2(
 void single_layer_kv_transfer_kernel_v2_separate(
     kvcache_ops::AscendType type, kvcache_ops::AscendType slotType,
     uint32_t blockDim, void *stream, uint8_t *lmcKeyValueCachePtr,
-    uint8_t *vllmKeyPtr, uint8_t *vllmValuePtr, uint8_t *slotMappingPtr,
+    uint8_t *vllmKeyPtr, uint8_t *vllmValuePtr, uint8_t *vllmDsaKeyPtr,
+    uint8_t *slotMappingPtr,
     const int64_t keyBlockStride, const int64_t valueBlockStride,
+    const int64_t dsaKeyBlockStride,
     const int64_t vllmKeyBufferSize, const int64_t vllmValueBufferSize,
+    const int64_t vllmDsaKeyBufferSize,
     const int64_t lmcTokenStride, const int64_t lmcValueOffset,
+    const int64_t lmcDsaOffset,
     const int64_t lmcBufferSize, const int32_t maxTokensPerLoop,
-    const int32_t numHeads, const int32_t headDims, const int32_t numTokens,
+    const int32_t numHeads, const int32_t headDims,
+    const int32_t vHeadDims, const int32_t dsaHeadDims,
+    const int32_t numTokens,
     const int32_t blockSize, const bool page2L, const bool lmcTokensMajor);
 
 void load_and_reshape_flash_kernel(

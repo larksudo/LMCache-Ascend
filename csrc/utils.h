@@ -100,8 +100,8 @@ struct KVTransferDims {
 struct KVTransferPointers {
   uint8_t *lmc_ptr;
   uint8_t *vllm_k_ptr;
-  uint8_t
-      *vllm_v_ptr; // valid only in Separate mode and is nullptr in Merged mode
+  uint8_t *vllm_v_ptr; // valid only in Separate mode and is nullptr in Merged mode
+  uint8_t *vllm_dsa_ptr; // valid only in DSA mode (3rd tensor), nullptr otherwise
   uint8_t *slot_mapping_ptr;
 };
 
@@ -112,18 +112,21 @@ struct KVTransferStrides {
 
   int64_t lmc_token_stride;
   int64_t lmc_val_offset; // Offset between K and V (if !token_major)
+  int64_t lmc_dsa_offset; // Offset of DSA data within a token (K+V)
   int64_t lmc_bytes;
 
   int64_t vllm_k_stride;
 
   // valid only in Separate mode
   int64_t vllm_v_stride;
+  int64_t vllm_dsa_stride; // DSA 3rd tensor block stride
 
   // valid only in Merged mode
   int64_t vllm_val_offset;
 
   int64_t vllm_k_bytes;
   int64_t vllm_v_bytes;
+  int64_t vllm_dsa_bytes; // DSA 3rd tensor buffer size
 };
 
 struct KVTransferUBParams {
@@ -144,6 +147,11 @@ struct SingleLayerKVConfig {
 
   bool direction;   // false: H2D, true: D2H
   bool token_major; // true: [tokens, ...], false: [..., tokens, ...]
+
+  kvcache_ops::KVCacheFormat kvcache_format; // MERGED/SEPARATE/MLA/DSA
+  int64_t k_hidden_dims;  // MLA: kv_lora_rank (512)
+  int64_t v_hidden_dims;  // MLA: qk_rope_head_dim (64)
+  int64_t dsa_hidden_dims; // DSA only: 128
 };
 
 struct HostChunkMetadata {
@@ -154,21 +162,32 @@ struct HostChunkMetadata {
   int64_t element_size;
 };
 
-void compute_single_layer_ub_params(const KVTransferDims &dims,
-                                    KVTransferUBParams &ub_params,
-                                    const torch::Tensor &vllm_cache);
+void compute_single_layer_ub_params(
+    const KVTransferDims &dims, KVTransferUBParams &ub_params,
+    const torch::Tensor &vllm_cache,
+    kvcache_ops::KVCacheFormat kvcache_format = kvcache_ops::KVCacheFormat::MERGED_KV,
+    int64_t v_hidden_dims = 0, int64_t dsa_hidden_dims = 0);
 
 void compute_single_layer_strides(
     const KVTransferDims &dims, KVTransferStrides &strides,
     const torch::Tensor &lmc_cache, const torch::Tensor &vllm_k_cache,
     bool token_major,
     bool vllm_two_major, // valid only in Merged mode
-    bool is_separate, const torch::Tensor *vllm_v_cache = nullptr);
+    bool use_separate_tensors, // true for SEPARATE_KV, MLA_KV, DSA_KV
+    const torch::Tensor *vllm_v_cache = nullptr,
+    bool is_mla = false, int64_t k_hidden_dims = 0,
+    int64_t v_hidden_dims = 0, bool is_dsa = false,
+    int64_t dsa_hidden_dims = 0,
+    const torch::Tensor *vllm_dsa_cache = nullptr);
 
 SingleLayerKVConfig prepare_single_layer_kv_config(
     torch::Tensor &lmc_dst_cache, std::vector<torch::Tensor> &vllm_kv_caches,
     torch::Tensor &slot_mapping, bool direction, bool token_major,
-    bool vllm_two_major, bool is_separate);
+    bool vllm_two_major,
+    bool use_separate_tensors, // true for SEPARATE_KV, MLA_KV, DSA_KV
+    kvcache_ops::KVCacheFormat kvcache_format = kvcache_ops::KVCacheFormat::MERGED_KV,
+    int64_t k_hidden_dims = 0, int64_t v_hidden_dims = 0,
+    int64_t dsa_hidden_dims = 0);
 
 HostChunkMetadata
 prepare_host_chunk_metadata(const std::vector<torch::Tensor> &lmc_tensors,

@@ -228,7 +228,7 @@ void single_layer_kv_transfer(
     // vllm_two_major=false: [num_blocks, 2, block_size, num_heads, head_size]
     torch::Tensor &slot_mapping, // [num_tokens]
     const bool direction, // false: LMCache -> Paged, true: Paged -> LMCache
-    const int kvcache_format_raw, // 1: MERGED_KV, 2: SEPARATE_KV
+    const int kvcache_format_raw, // 1: MERGED_KV, 2: SEPARATE_KV, 3: MLA_KV, 4: DSA_KV
     const bool
         token_major, // true: [tokens, 2, hidden], false: [2, tokens, hidden]
     const bool vllm_two_major // true: [2, blocks, ...], false: [blocks, 2, ...]
@@ -238,16 +238,39 @@ void single_layer_kv_transfer(
 
   const c10::OptionalDeviceGuard slot_device_guard(device_of(slot_mapping));
 
+  auto kvcache_format =
+      static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw);
+  bool is_mla = (kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV);
+  bool is_dsa = (kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV);
+
+  // For MLA, extract hidden dims from vllm kv_caches
+  int64_t k_hidden_dims = 0, v_hidden_dims = 0, dsa_hidden_dims = 0;
+  if (is_mla) {
+    k_hidden_dims = vllm_kv_caches[0].size(-1);  // kv_lora_rank
+    v_hidden_dims = vllm_kv_caches[1].size(-1);  // qk_rope_head_dim
+  } else if (is_dsa) {
+    k_hidden_dims = vllm_kv_caches[0].size(-1);
+    v_hidden_dims = vllm_kv_caches[1].size(-1);
+    dsa_hidden_dims = vllm_kv_caches[2].size(-1);
+  }
+
+  // MLA/DSA are distinct from SEPARATE_KV but use the same separate kernel
+  // path because K and V are in different tensors.
+  bool use_separate_kernel = is_separate || is_mla || is_dsa;
+
   SingleLayerKVConfig config = prepare_single_layer_kv_config(
       lmc_key_value_cache, vllm_kv_caches, slot_mapping, direction, token_major,
-      vllm_two_major, is_separate);
+      vllm_two_major, use_separate_kernel, kvcache_format,
+      k_hidden_dims, v_hidden_dims, dsa_hidden_dims);
 
   at_npu::native::OpCommand cmd;
-  cmd.Name(is_separate ? "single_layer_kv_transfer_kernel_v2_separate"
-                       : "single_layer_kv_transfer_kernel_v2");
+  cmd.Name(use_separate_kernel
+               ? "single_layer_kv_transfer_kernel_v2_separate"
+               : "single_layer_kv_transfer_kernel_v2");
 
-  cmd.SetCustomHandler([config, is_separate]() -> int {
-    if (!is_separate) {
+  cmd.SetCustomHandler([config, use_separate_kernel, is_mla, is_dsa,
+                        k_hidden_dims, v_hidden_dims, dsa_hidden_dims]() -> int {
+    if (!use_separate_kernel) {
       // Merged KV Kernel
       kvcache_ops::single_layer_kv_transfer_kernel_v2(
           config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
@@ -260,17 +283,23 @@ void single_layer_kv_transfer(
           config.dims.num_heads, config.dims.head_dims, config.dims.num_tokens,
           config.dims.block_size, config.direction, config.token_major);
     } else {
-      // Separate KV Kernel
+      // Separate/MLA/DSA KV Kernel
+      // For MLA/DSA, head_dims is k_hidden_dims and v has different size
+      int64_t v_head_dims = (is_mla || is_dsa) ? v_hidden_dims : config.dims.head_dims;
+      int64_t dsa_head_dims = is_dsa ? dsa_hidden_dims : 0;
       kvcache_ops::single_layer_kv_transfer_kernel_v2_separate(
           config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
           config.ub_params.aiv_num, config.ub_params.stream,
           config.ptrs.lmc_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
-          config.ptrs.slot_mapping_ptr, config.strides.vllm_k_stride,
-          config.strides.vllm_v_stride, config.strides.vllm_k_bytes,
-          config.strides.vllm_v_bytes, config.strides.lmc_token_stride,
-          config.strides.lmc_val_offset, config.strides.lmc_bytes,
+          config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
+          config.strides.vllm_k_stride, config.strides.vllm_v_stride,
+          config.strides.vllm_dsa_stride, config.strides.vllm_k_bytes,
+          config.strides.vllm_v_bytes, config.strides.vllm_dsa_bytes,
+          config.strides.lmc_token_stride, config.strides.lmc_val_offset,
+          config.strides.lmc_dsa_offset, config.strides.lmc_bytes,
           config.ub_params.max_tokens_per_loop, config.dims.num_heads,
-          config.dims.head_dims, config.dims.num_tokens, config.dims.block_size,
+          config.dims.head_dims, v_head_dims, dsa_head_dims,
+          config.dims.num_tokens, config.dims.block_size,
           config.direction, config.token_major);
     }
     return 0;
@@ -311,13 +340,34 @@ void batched_fused_single_layer_kv_transfer(
   const c10::OptionalDeviceGuard slot_device_guard(
       device_of(slot_mapping_full));
 
+  auto kvcache_format =
+      static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw);
+  bool is_mla = (kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV);
+  bool is_dsa = (kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV);
+
+  // For MLA, extract hidden dims from vllm kv_caches
+  int64_t k_hidden_dims = 0, v_hidden_dims = 0, dsa_hidden_dims = 0;
+  if (is_mla) {
+    k_hidden_dims = vllm_kv_caches[0].size(-1);
+    v_hidden_dims = vllm_kv_caches[1].size(-1);
+  } else if (is_dsa) {
+    k_hidden_dims = vllm_kv_caches[0].size(-1);
+    v_hidden_dims = vllm_kv_caches[1].size(-1);
+    dsa_hidden_dims = vllm_kv_caches[2].size(-1);
+  }
+
+  // MLA/DSA are distinct from SEPARATE_KV but use the same separate kernel
+  // path because K and V are in different tensors.
+  bool use_separate_kernel = is_separate || is_mla || is_dsa;
+
   SingleLayerKVConfig config = prepare_single_layer_kv_config(
       staging_cache, vllm_kv_caches, slot_mapping_full, direction, token_major,
-      vllm_two_major, is_separate);
+      vllm_two_major, use_separate_kernel, kvcache_format,
+      k_hidden_dims, v_hidden_dims, dsa_hidden_dims);
 
   int64_t element_size = staging_cache.element_size();
 
-  if (!is_separate) {
+  if (!use_separate_kernel) {
     auto launcher = [config](bool is_gather) {
       kvcache_ops::single_layer_kv_transfer_kernel_v2(
           config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
@@ -334,18 +384,25 @@ void batched_fused_single_layer_kv_transfer(
                                element_size, launcher);
 
   } else {
-    auto launcher = [config](bool is_gather) {
+    auto launcher = [config, is_mla, is_dsa, v_hidden_dims,
+                     dsa_hidden_dims](bool is_gather) {
+      int64_t v_head_dims =
+          (is_mla || is_dsa) ? v_hidden_dims : config.dims.head_dims;
+      int64_t dsa_head_dims = is_dsa ? dsa_hidden_dims : 0;
       kvcache_ops::single_layer_kv_transfer_kernel_v2_separate(
           config.ub_params.scalar_type_num, config.ub_params.slot_type_num,
           config.ub_params.aiv_num, config.ub_params.stream,
           config.ptrs.lmc_ptr, config.ptrs.vllm_k_ptr, config.ptrs.vllm_v_ptr,
-          config.ptrs.slot_mapping_ptr, config.strides.vllm_k_stride,
-          config.strides.vllm_v_stride, config.strides.vllm_k_bytes,
-          config.strides.vllm_v_bytes, config.strides.lmc_token_stride,
-          config.strides.lmc_val_offset, config.strides.lmc_bytes,
+          config.ptrs.vllm_dsa_ptr, config.ptrs.slot_mapping_ptr,
+          config.strides.vllm_k_stride, config.strides.vllm_v_stride,
+          config.strides.vllm_dsa_stride, config.strides.vllm_k_bytes,
+          config.strides.vllm_v_bytes, config.strides.vllm_dsa_bytes,
+          config.strides.lmc_token_stride, config.strides.lmc_val_offset,
+          config.strides.lmc_dsa_offset, config.strides.lmc_bytes,
           config.ub_params.max_tokens_per_loop, config.dims.num_heads,
-          config.dims.head_dims, config.dims.num_tokens, config.dims.block_size,
-          is_gather, config.token_major);
+          config.dims.head_dims, v_head_dims, dsa_head_dims,
+          config.dims.num_tokens, config.dims.block_size, is_gather,
+          config.token_major);
     };
     run_batched_fused_transfer(config, lmc_tensors, chunk_offsets, chunk_sizes,
                                element_size, launcher);
