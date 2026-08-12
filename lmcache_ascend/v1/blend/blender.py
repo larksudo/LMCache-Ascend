@@ -1,19 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-import os
-import time
 from typing import Optional, Union
 
 # Third Party
 from lmcache.logging import init_logger
 from lmcache.v1.compute.blend.metadata import LMCBlendCommonMetadata, LMCBlendMetadata
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.trace_utils import (
-    emit_layer_timer,
-    mask_to_string,
-    tensor_to_list,
-    trace_flow,
-)
 import torch
 
 # First Party
@@ -74,66 +66,6 @@ class LMCBlender:
             attn_mask=None,
             positions=None,
         )
-        trace_value = str(os.environ.get("LMCACHE_TRACE_BLEND", "0")).strip().lower()
-        self.trace_blend = trace_value not in {"", "0", "false", "no", "off"}
-        self._trace_tokens_cpu: Optional[torch.Tensor] = None
-        self._trace_req_id: Optional[str] = None
-        self._active_timer_req_id: Optional[str] = None
-        self._active_timer_path: str = "nohole"
-        self._active_timer_load_mode: Optional[str] = None
-        self._layer_topk_ms: dict[int, float] = {}
-
-    def _emit_timer(self, bucket: str, layer_id: int, duration_ms: float) -> None:
-        emit_layer_timer(
-            bucket,
-            req_id=self._active_timer_req_id,
-            layer_id=layer_id,
-            duration_ms=duration_ms,
-            path=self._active_timer_path,
-            load_mode=self._active_timer_load_mode,
-        )
-
-    def get_last_topk_ms(self, layer_id: int) -> float:
-        return float(self._layer_topk_ms.get(layer_id, 0.0))
-
-    def emit_blend_timer(self, layer_id: int, duration_ms: float) -> None:
-        blend_ms = max(float(duration_ms) - self.get_last_topk_ms(layer_id), 0.0)
-        self._emit_timer("blend", layer_id, blend_ms)
-
-    def _log_recomputed_tokens(
-        self,
-        layer_id: int,
-        absolute_positions: torch.Tensor,
-        eligible_count: int,
-    ) -> None:
-        if not self.trace_blend:
-            return
-        if self._trace_tokens_cpu is None:
-            return
-        positions_cpu = absolute_positions.detach().to(device="cpu", dtype=torch.long)
-        token_ids = [
-            int(self._trace_tokens_cpu[pos].item())
-            for pos in positions_cpu.tolist()
-            if 0 <= int(pos) < int(self._trace_tokens_cpu.shape[0])
-        ]
-        logger.info(
-            "Blend recompute layer=%d req_id=%s eligible_tokens=%d "
-            "recomputed_positions=%s recomputed_token_ids=%s",
-            layer_id,
-            self._trace_req_id if self._trace_req_id is not None else "unknown",
-            eligible_count,
-            positions_cpu.tolist(),
-            token_ids,
-        )
-        trace_flow(
-            "blender.nohole",
-            "recompute_positions",
-            layer_id=layer_id,
-            req_id=self._trace_req_id,
-            eligible_tokens=eligible_count,
-            recomputed_positions=positions_cpu.tolist(),
-            recomputed_token_ids=token_ids,
-        )
 
     def _get_recomp_ratio(self, layer_id: int) -> float:
         """Return the recomputation ratio for ``layer_id``.
@@ -175,7 +107,6 @@ class LMCBlender:
     ):
         logger.debug(f"Blender is processing KV for layer {layer_id}")
         old_k, old_v = self.gpu_connector.get_kv(layer_id)
-        self._layer_topk_ms[layer_id] = 0.0
 
         if mask is not None:
             num_falses = mask.numel() - mask.long().sum().item()
@@ -207,7 +138,6 @@ class LMCBlender:
         if layer_id in self.common_metadata.check_layers:
             recomp_ratio = self._get_recomp_ratio(layer_id)
         if recomp_ratio > 0:
-            topk_start = time.perf_counter()
             assert k[num_falses:].shape[0] == old_k.shape[0], (
                 "Mismatch between number of tokens in k "
                 "(after skipping falses) and old_k"
@@ -225,22 +155,6 @@ class LMCBlender:
 
             top_indices = torch.topk(diff_k, k=topk_num).indices
             top_indices, _ = torch.sort(top_indices)
-            absolute_top_indices = top_indices + num_falses
-            topk_ms = (time.perf_counter() - topk_start) * 1000.0
-            self._layer_topk_ms[layer_id] = topk_ms
-            self._emit_timer("topk_l1", layer_id, topk_ms)
-            self._log_recomputed_tokens(layer_id, absolute_top_indices, total_len)
-            trace_flow(
-                "blender.nohole",
-                "process_qkv",
-                layer_id=layer_id,
-                req_id=kwargs.get("req_id", self._trace_req_id),
-                num_falses=num_falses,
-                eligible_tokens=total_len,
-                topk_num=topk_num,
-                top_indices=top_indices.tolist(),
-                absolute_top_indices=absolute_top_indices.tolist(),
-            )
 
             k, v = k[top_indices], v[top_indices]
             q = q[top_indices]
@@ -279,25 +193,14 @@ class LMCBlender:
 
         # TODO(Jiayi): store is currently not included in this function
 
-        layerwise_model_executor = self.layerwise_model.compute_layer(
-            tokens,
-            mask,
-            req_id=kwargs.get("req_id"),
-        )
-        layerwise_retriever = self.cache_engine.retrieve_layer(
-            tokens,
-            mask,
-            gpu_connector_override=self.gpu_connector,
-            **kwargs,
-        )
+        layerwise_model_executor = self.layerwise_model.compute_layer(tokens, mask)
+        layerwise_retriever = self.cache_engine.retrieve_layer(tokens, mask, **kwargs)
 
         next(layerwise_retriever)
         yield
 
         for i in range(self.num_layers):
-            wait_start = time.perf_counter()
             next(layerwise_retriever)
-            self._emit_timer("wait_reuse", i, (time.perf_counter() - wait_start) * 1000.0)
             next(layerwise_model_executor)
             yield
 
@@ -317,34 +220,7 @@ class LMCBlender:
         """
         if isinstance(tokens, list):
             tokens = torch.tensor(tokens).npu()
-        trace_flow(
-            "blender.nohole",
-            "blend_start",
-            req_id=kwargs.get("req_id"),
-            token_count=len(tokens),
-            mask=mask_to_string(mask),
-            token_ids=tensor_to_list(tokens, dtype=torch.long),
-        )
-        if self.trace_blend:
-            self._trace_tokens_cpu = tokens.detach().to(device="cpu", dtype=torch.long)
-            req_id = kwargs.get("req_id")
-            self._trace_req_id = None if req_id is None else str(req_id)
-        req_id = kwargs.get("req_id")
-        self._active_timer_req_id = None if req_id is None else str(req_id)
-        self._active_timer_path = str(kwargs.get("timer_path", "nohole"))
-        timer_load_mode = kwargs.get("timer_load_mode")
-        self._active_timer_load_mode = (
-            None if timer_load_mode is None else str(timer_load_mode)
-        )
         layerwise_blender = self.blend_layer(tokens, mask, **kwargs)
 
-        try:
-            for i in range(self.num_layers + 2):
-                next(layerwise_blender)
-        finally:
-            self._trace_tokens_cpu = None
-            self._trace_req_id = None
-            self._active_timer_req_id = None
-            self._active_timer_path = "nohole"
-            self._active_timer_load_mode = None
-            self._layer_topk_ms.clear()
+        for i in range(self.num_layers + 2):
+            next(layerwise_blender)
