@@ -1,0 +1,20 @@
+lmcache_ascend/integration/vllm/lmcache_ascend_connector.py
+  h_dffb05a36fbb51 16-21,37-39,46-48
+.github/workflows/perf-and-accuracy.yml
+  h_dffb05a36fbb51 122-123,283
+.github/workflows/build-and-test.yml
+  h_dffb05a36fbb51 90,204,299-300,419
+lmcache_ascend/integration/vllm/lmcache_ascend_connector_v1.py
+  h_dffb05a36fbb51 39-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "861832af064295a659e3a5f088199cc938930d0a",
+  "prompts": {},
+  "humans": {
+    "h_dffb05a36fbb51": {
+      "author": "sunshine <1163852160@qq.com>"
+    }
+  }
+}
