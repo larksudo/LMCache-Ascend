@@ -1,0 +1,14 @@
+docs/deepseek_v4/dsv4-deployment-guide.md
+  h_dffb05a36fbb51 88-110
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "5ac6b78599ee3d7a793799c8177b178928bab2c2",
+  "prompts": {},
+  "humans": {
+    "h_dffb05a36fbb51": {
+      "author": "sunshine <1163852160@qq.com>"
+    }
+  }
+}
