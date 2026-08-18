@@ -1,0 +1,18 @@
+tests/v1/test_layer_to_scheduler_group_mapping.py
+  h_dffb05a36fbb51 21,286-415
+lmcache_ascend/v1/kv_format.py
+  h_dffb05a36fbb51 12-28,54-58
+lmcache_ascend/integration/vllm/multi_spec_flatten.py
+  h_dffb05a36fbb51 15,17-19,114-136,152-158,282-301,307-310,312
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "57b7cc7ea2601928a756a6d88a35fdf9b43bbdbe",
+  "prompts": {},
+  "humans": {
+    "h_dffb05a36fbb51": {
+      "author": "sunshine <1163852160@qq.com>"
+    }
+  }
+}
