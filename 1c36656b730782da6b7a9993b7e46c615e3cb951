@@ -1,0 +1,58 @@
+lmcache_ascend/v1/npu_connector/npu_connectors.py
+  h_dffb05a36fbb51 766
+docker/mindspore/Dockerfile.a2.openEuler
+  h_dffb05a36fbb51 29
+lmcache_ascend/integration/vllm/multi_group_vllm_adapter.py
+  h_dffb05a36fbb51 13,19,21,24,34-37,40,229,362,541
+lmcache_ascend/integration/vllm/multi_spec_flatten.py
+  h_dffb05a36fbb51 4,7,11,14,258
+docker/Dockerfile.a3.openEuler
+  h_dffb05a36fbb51 30
+docker/Dockerfile.310p.openEuler
+  h_dffb05a36fbb51 30
+.github/workflows/code-quality.yml
+  h_dffb05a36fbb51 13
+lmcache_ascend/integration/vllm/skip_state_groups.py
+  h_dffb05a36fbb51 4,7,12,173,211-212
+tests/v1/conftest_ds4.py
+  h_dffb05a36fbb51 4,7,13,24,37,206,470,536,553
+tests/v1/test_mem_kernels.py
+  h_dffb05a36fbb51 2,5,15-17,19-28,31-34,1555-1557,1730,1749-1750,1826,1850-1851
+csrc/utils.cpp
+  h_dffb05a36fbb51 74
+.github/workflows/perf-and-accuracy.yml
+  h_dffb05a36fbb51 6-7
+docs/deployment.md
+  h_dffb05a36fbb51 17-25,27-31,33-41
+docs/deepseek_v4/dsv4-deployment-guide.md
+  h_dffb05a36fbb51 1-2,5-7,25,27-28,30-46,50-51,53-60,68-70,72,82,113-114,116,119-120,123-124,128-130,137,140-142,148-149,154,157-158,160,163-164,170-171,175-177,184,187-189,192-193,195-197,213,249
+.github/workflows/build-and-test.yml
+  h_dffb05a36fbb51 6-7
+lmcache_ascend/integration/vllm/lmcache_ascend_connector.py
+  h_dffb05a36fbb51 4,7,10,27
+csrc/mem_kernels.cpp
+  h_dffb05a36fbb51 457-458
+docker/Dockerfile.a2.openEuler
+  h_dffb05a36fbb51 30
+docker/Dockerfile.a3
+  h_dffb05a36fbb51 30
+tests/v1/conftest_kvcache.py
+  h_dffb05a36fbb51 360
+tests/v1/test_npu_connector_mixed_format.py
+  h_dffb05a36fbb51 4,7,11,21,268-269,273,419-420
+tests/v1/test_ds4_kvcache_roundtrip.py
+  h_dffb05a36fbb51 4,7,11,16,37,69,73,108-109,137-138
+docker/mindspore/Dockerfile.310p.openEuler
+  h_dffb05a36fbb51 29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "1c36656b730782da6b7a9993b7e46c615e3cb951",
+  "prompts": {},
+  "humans": {
+    "h_dffb05a36fbb51": {
+      "author": "sunshine <1163852160@qq.com>"
+    }
+  }
+}
