@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
@@ -8,6 +9,7 @@ from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorMetadata,
     KVConnectorRole,
 )
 from vllm.distributed.parallel_state import get_pp_group
@@ -30,9 +32,32 @@ if TYPE_CHECKING:
     # Third Party
     from vllm.config import VllmConfig
     from vllm.forward_context import ForwardContext
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _coerce_preempted_req_ids(arg: Any) -> set:
+    """Normalize the handle_preemptions() argument across vLLM versions.
+
+    Older vLLM passes the preempted request ids (an iterable) directly,
+    while newer vLLM passes the connector metadata object, which carries
+    the ids in ``preempted_req_ids`` (populated by build_connector_meta()).
+    """
+    if arg is None:
+        return set()
+    if isinstance(arg, (set, frozenset, list, tuple)):
+        return set(arg)
+    ids = getattr(arg, "preempted_req_ids", None)
+    return set(ids) if ids else set()
+
+
+@dataclass
+class LMCacheAscendConnectorMetadata(LMCacheConnectorMetadata):
+    """LMCache request metadata plus vLLM scheduler preemption hints."""
+
+    preempted_req_ids: set[str] = field(default_factory=set)
 
 
 class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
@@ -58,6 +83,21 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
         self._finished_req_ids_waiting_for_save: set[str] = set()
         self._late_finished_sending: set[str] = set()
         logger.debug("store_async: %s", self.store_async)
+
+    @_lmcache_nvtx_annotate
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> KVConnectorMetadata:
+        """Build per-step metadata and carry preempted request IDs to workers."""
+        metadata = super().build_connector_meta(scheduler_output)
+        assert isinstance(metadata, LMCacheConnectorMetadata)
+
+        return LMCacheAscendConnectorMetadata(
+            requests=metadata.requests,
+            preempted_req_ids=set(
+                getattr(scheduler_output, "preempted_req_ids", None) or ()
+            ),
+        )
 
     @_lmcache_nvtx_annotate
     def register_kv_caches(
@@ -486,7 +526,16 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
                 else:
                     skip_leading_tokens = 0
 
+                skip_leading_tokens = self._pd_producer_skip_leading_tokens(
+                    skip_leading_tokens, request
+                )
+
                 if skip_leading_tokens == len(token_ids):
+                    # No tokens left to store, so the transfer path that
+                    # normally carries the PD completion signal is skipped.
+                    # discard_partial_chunks truncates a sub-chunk prompt to
+                    # zero tokens, which lands here on the very first prefill.
+                    self._notify_pd_prefill_done(request)
                     continue
                 skip_leading_tokens = (
                     skip_leading_tokens
@@ -569,10 +618,48 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
                     "wait_for_save failed for request %s; skipping save",
                     request.req_id,
                 )
+                # A failed save must still release the proxy. If the transfer
+                # already signaled, the sender drops this as a duplicate.
+                self._notify_pd_prefill_done(request)
                 continue
 
         self._wait_for_save_done = True
         self._replay_finished_stores_after_save()
+
+    def _notify_pd_prefill_done(self, request) -> None:
+        """Release the PD proxy for a request whose save loop stored nothing.
+
+        ``wait_decode_kv_ready`` on the proxy has no timeout, so a last-prefill
+        request that never reaches the chunk-transfer path hangs that
+        connection indefinitely. Marking the spec first keeps the engine-side
+        check consistent with the normal store path.
+        """
+        disagg_spec = getattr(request, "disagg_spec", None)
+        if disagg_spec is None or not request.is_last_prefill:
+            return
+        disagg_spec.is_last_prefill = True
+        try:
+            self.lmcache_engine.notify_pd_prefill_done(disagg_spec)
+        except Exception:
+            logger.exception(
+                "Failed to signal PD prefill done for request %s",
+                request.req_id,
+            )
+
+    def _pd_producer_skip_leading_tokens(self, skip_leading_tokens: int, request) -> int:
+        """Clamp producer store skip to tokens already transferred to D.
+
+        ``skip_leading_tokens`` may come from local/P2P cache hits, but PD
+        handoff can only skip tokens that the paired decoder has already
+        received for this request. This preserves the upstream LMCache producer
+        guard while keeping Ascend's LocalCPU backfill skip calculation.
+        """
+        if self.kv_role == "kv_producer" and request.disagg_spec:
+            return min(
+                skip_leading_tokens,
+                request.disagg_spec.num_transferred_tokens,
+            )
+        return skip_leading_tokens
 
     def _local_persist_skip(self, request, token_ids) -> Optional[int]:
         """Decide whether a remote-loaded prefix must be persisted locally.
@@ -680,8 +767,13 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
             None,
         )
 
-    def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
+    def handle_preemptions(self, preempted_req_ids: Any) -> None:
         if self.lmcache_engine is None:
+            return
+
+        # Newer vLLM passes LMCacheConnectorMetadata instead of the raw ids.
+        preempted_req_ids = _coerce_preempted_req_ids(preempted_req_ids)
+        if not preempted_req_ids:
             return
 
         logger.debug(

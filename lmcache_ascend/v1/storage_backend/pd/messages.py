@@ -54,6 +54,9 @@ class PullReadyNotif(msgspec.Struct, tag=True):
     shape: list[int]
     dtype: str
     last_chunk_toks: int
+    # Logical request handoff shared by all TP ranks.  Unlike pull_id (which is
+    # per transfer batch), this ID is also propagated to the decoder request.
+    handoff_id: str = ""
 
 
 class PullReadyDoneAck(msgspec.Struct, tag=True):

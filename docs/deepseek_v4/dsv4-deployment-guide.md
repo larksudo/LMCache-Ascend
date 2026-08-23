@@ -14,7 +14,7 @@ mkdir -p /mnt/sdb/<USER_ID>
 
 > This directory is mounted into the container for storing source code, configs, and benchmarks.
 
----
+***
 
 ## 2. Docker Container Startup
 
@@ -60,7 +60,7 @@ docker run \
     -it $IMAGE bash
 ```
 
----
+***
 
 ## 3. Install from Source (Inside the Container)
 
@@ -78,6 +78,7 @@ cd ..
 ```
 
 ### 3.2 Install LMCache-Ascend
+
 ```bash
 cd /mnt/sdb/<USER_ID>
 git clone --recurse-submodules -b dsv4_support_045 https://github.com/LMCache/LMCache-Ascend.git
@@ -85,7 +86,7 @@ cd LMCache-Ascend
 pip install -v --no-build-isolation -e .
 ```
 
-> **Important — `third_party/hcomm` must match the container's CANN version.**
+> **Important —** **`third_party/hcomm`** **must match the container's CANN version.**
 
 > 1. Check the container's CANN version:
 >    ```bash
@@ -108,11 +109,12 @@ pip install -v --no-build-isolation -e .
 >    pip install -v --no-build-isolation -e .
 >    ```
 
----
+***
 
 ## 4. Service Startup Configuration
 
 ### 4.1 LMCache Config File
+
 Create `lmcache-config-ddr.yaml`:
 
 ```yaml
@@ -131,6 +133,7 @@ extra_config:
 The Base (HBM) and DDR scripts are identical except the DDR version adds `LMCACHE_CONFIG_FILE` and `--kv-transfer-config`.
 
 #### Base: HBM (Native HBM Prefix Cache)
+
 ```bash
 #!/bin/sh
 export OMP_PROC_BIND=false
@@ -174,7 +177,9 @@ vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V4-Flash-w8a8
 ```
 
 #### DDR: System Memory Cache Only
+
 > Requires `/mnt/sdb/<USER_ID>/lmcache-config-ddr.yaml` (Section 4.1).
+
 ```bash
 #!/bin/sh
 export OMP_PROC_BIND=false
@@ -225,11 +230,12 @@ vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V4-Flash-w8a8
     }' > ds_lmcache_ddr.log 2>&1
 ```
 
----
+***
 
 ## 5. Benchmark Testing
 
 ### 5.1 Multi-Round Conversation Bench
+
 Evaluates external cache retrieval and hit rate in multi-round long conversations.
 
 ```bash
@@ -247,6 +253,7 @@ python3 /mnt/sdb/<USER_ID>/LMCache/benchmarks/multi_round_qa/multi-round-qa.py \
 ```
 
 ### 5.2 Prefix Repetition Bench
+
 Evaluates throughput and latency under high concurrency with repeated prefixes.
 
 ```bash
@@ -263,10 +270,12 @@ vllm bench serve \
   --prefix-repetition-num-prefixes 50
 ```
 
----
+***
+
 ## 6. Tips
 
 > **To reveal LMCache advantages**:
+>
 > 1. **Increase concurrency**: Raise `--num-users` (e.g., 128/256) or `--max-concurrency` until HBM fills up and eviction occurs.
 > 2. **Disable native prefix cache**: Add `--no-enable-prefix-caching` to test LMCache IO efficiency in isolation.
 

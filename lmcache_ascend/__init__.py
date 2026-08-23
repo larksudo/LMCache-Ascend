@@ -200,6 +200,17 @@ def _patch_config():
         "This config is only used when pd_pull_mode is set to True.",
     }
 
+    # Add pd_handoff_lease_ttl config
+    lmcache.v1.config._CONFIG_DEFINITIONS["pd_handoff_lease_ttl"] = {
+        "type": float,
+        "default": 300.0,
+        "env_converter": float,
+        "description": "TTL in seconds for receiver-side PD pull handoff leases. "
+        "The lease protects PullReady hits until the decoder lookup claims them. "
+        "Expired, unclaimed handoffs are released to avoid leaked KV entries. "
+        "Keep this lower than pd_pull_pending_ttl on the sender.",
+    }
+
     # Add pd_pull_backpressure_reserve_pct config
     lmcache.v1.config._CONFIG_DEFINITIONS["pd_pull_backpressure_reserve_pct"] = {
         "type": float,
@@ -437,6 +448,9 @@ def _patch_storage_manager():
         allocate_and_copy_objects as ascend_allocate_and_copy_objects,
     )
     from lmcache_ascend.v1.storage_backend.storage_manager import (
+        batched_contains as ascend_batched_contains,
+    )
+    from lmcache_ascend.v1.storage_backend.storage_manager import (
         batched_get as ascend_batched_get,
     )
     from lmcache_ascend.v1.storage_backend.storage_manager import get as ascend_get
@@ -447,6 +461,7 @@ def _patch_storage_manager():
     )
 
     lm_storage_manager.StorageManager.get = ascend_get
+    lm_storage_manager.StorageManager.batched_contains = ascend_batched_contains
     lm_storage_manager.StorageManager.batched_get = ascend_batched_get
     lm_storage_manager.StorageManager.prefetch_all_done_callback = (
         patched_prefetch_all_done_callback
@@ -627,7 +642,19 @@ def _patch_vllm_v1_adapter():
     lmc_vllm_v1_adapter.ReqMeta = mg.ReqMeta
     lmc_vllm_v1_adapter.LMCacheConnectorV1Impl = ascend_LMCacheAscendConnectorV1Impl
 
-    def handle_preemptions(self, preempted_req_ids):
+    def handle_preemptions(self, preemption_payload):
+        # vLLM 0.18 passes request IDs directly, while vLLM 0.23 carries
+        # them in connector metadata built by the scheduler-side adapter.
+        if isinstance(preemption_payload, set):
+            preempted_req_ids = set(preemption_payload)
+        else:
+            preempted_req_ids = set(
+                getattr(preemption_payload, "preempted_req_ids", None) or ()
+            )
+
+        if not preempted_req_ids:
+            return
+
         method = getattr(self._lmcache_engine, "handle_preemptions", None)
         if callable(method):
             method(preempted_req_ids)

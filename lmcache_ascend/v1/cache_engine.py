@@ -28,6 +28,9 @@ import torch
 
 # First Party
 from lmcache_ascend.v1.memory_management import is_multi_group_memory_obj
+from lmcache_ascend.v1.storage_backend.pd.handoff import (
+    split_pd_handoff_request_config,
+)
 
 logger = init_logger(__name__)
 
@@ -120,6 +123,50 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         if self.kv_events_enabled and self.is_store_async:
             self.kv_events = ThreadSafeEventList()
+
+    def _is_pd_receiver(self) -> bool:
+        return self.config.enable_pd and self.config.pd_role == "receiver"
+
+    def _release_pd_request_lease(self, request_id: Optional[str]) -> None:
+        if not request_id or request_id == "unspecified":
+            return
+        if not self._is_pd_receiver() or self.storage_manager is None:
+            return
+
+        pd_backend = self.storage_manager.storage_backends.get("PDBackend")
+        release_request_lease = getattr(pd_backend, "release_request_lease", None)
+        if callable(release_request_lease):
+            release_request_lease(request_id)
+
+    def _promote_pd_handoff_lease(
+        self,
+        handoff_id: Optional[str],
+        request_id: Optional[str],
+    ) -> None:
+        if not handoff_id or not request_id or request_id == "unspecified":
+            return
+        if not self.is_healthy():
+            # Base lookup will return zero; keep the bounded synthetic lease so
+            # its TTL cleanup, rather than an untracked real owner, owns abort.
+            return
+        if not self._is_pd_receiver() or self.storage_manager is None:
+            return
+
+        pd_backend = self.storage_manager.storage_backends.get("PDBackend")
+        promote_handoff_lease = getattr(pd_backend, "promote_handoff_lease", None)
+        if callable(promote_handoff_lease):
+            promote_handoff_lease(handoff_id, request_id)
+
+    @staticmethod
+    def _extract_pd_handoff_from_kwargs(kwargs: dict) -> Optional[str]:
+        request_configs = kwargs.get("request_configs")
+        handoff_id, sanitized = split_pd_handoff_request_config(request_configs)
+        if sanitized is not request_configs:
+            # ``kwargs`` is method-local.  Replacing this value avoids mutating
+            # the request-owned dict while keeping the control key out of token
+            # hashing and CacheEngineKey construction.
+            kwargs["request_configs"] = sanitized
+        return handoff_id
 
     def _ensure_store_worker(self) -> None:
         if self._store_queue is not None:
@@ -618,6 +665,39 @@ class AscendLMCacheEngine(LMCacheEngine):
         mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        """Retrieve the KV caches with PD request-lease bookkeeping.
+
+        Promotes the PullReady handoff lease to this request and registers the
+        retrieve context so the PD backend hands out per-request proxies.
+        """
+        req_id = self._get_req_id(kwargs)
+        handoff_id = self._extract_pd_handoff_from_kwargs(kwargs)
+        self._promote_pd_handoff_lease(handoff_id, req_id)
+        token = None
+        if self._is_pd_receiver():
+            from lmcache_ascend.v1.storage_backend.storage_manager import (
+                set_current_pd_retrieve_id,
+            )
+
+            token = set_current_pd_retrieve_id(req_id)
+
+        try:
+            return self._retrieve_impl(tokens, mask=mask, **kwargs)
+        finally:
+            if token is not None:
+                from lmcache_ascend.v1.storage_backend.storage_manager import (
+                    reset_current_pd_retrieve_id,
+                )
+
+                reset_current_pd_retrieve_id(token)
+            self._release_pd_request_lease(req_id)
+
+    def _retrieve_impl(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
         """Retrieve the KV caches from the cache engine. And put the retrieved
         KV cache to the serving engine via the GPU connector.
 
@@ -626,10 +706,12 @@ class AscendLMCacheEngine(LMCacheEngine):
         interleaving broadcast receive and ``batched_to_gpu`` per shard.
 
         :param tokens: The tokens of the corresponding KV caches.
+
         :param mask: The mask for the tokens. Should have the same length as
             tokens. The mask should ALWAYS be like FFFFFTTTTTTT, where True
             means the tokens needs to be matched, and the Falses will ALWAYS
             be at the PREFIX of the tensor.
+
         :param **kwargs: Forwarded to ``batched_to_gpu``. Should include KV
             cache specific information (e.g., paged KV buffer and the page
             tables).
@@ -783,6 +865,34 @@ class AscendLMCacheEngine(LMCacheEngine):
                     self._store_cv.notify_all()
                 self._store_queue.task_done()
 
+    def notify_pd_prefill_done(self, transfer_spec) -> None:
+        """Report PD prefill completion for a request that transfers no chunks.
+
+        The proxy blocks on one notification per active rank with no timeout,
+        and that notification is normally emitted as part of a chunk transfer.
+        A prefill that produces no chunks at all -- a prompt shorter than
+        ``chunk_size`` under ``discard_partial_chunks``, an already-saved
+        prefix, or an allocation failure -- would otherwise never report in.
+
+        Passive ranks stay silent: under ``save_only_first_rank`` only the
+        first rank stores, so only it is counted by the proxy.
+        """
+        if transfer_spec is None or not getattr(
+            transfer_spec, "is_last_prefill", False
+        ):
+            return
+        if self._is_passive() or self.storage_manager is None:
+            return
+        backend = self.storage_manager.storage_backends.get("PDBackend")
+        notify = getattr(backend, "notify_prefill_done", None)
+        if notify is None:
+            return
+        logger.debug(
+            "No KV chunk to transfer for req %s; signaling PD prefill done.",
+            transfer_spec.req_id,
+        )
+        notify(transfer_spec.req_id)
+
     @torch.inference_mode()
     def _run_store_pipeline(
         self,
@@ -815,6 +925,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "Freeze mode enabled, skipping store operation for %d tokens",
                 num_to_store_tokens,
             )
+            self.notify_pd_prefill_done(kwargs.get("transfer_spec"))
             return
 
         starts: List[int] = []
@@ -903,6 +1014,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
+            self.notify_pd_prefill_done(kwargs.get("transfer_spec"))
             return
 
         put_submitted = False
@@ -1053,21 +1165,42 @@ class AscendLMCacheEngine(LMCacheEngine):
         pin: bool = False,
         request_configs: Optional[dict] = None,
     ) -> int:
+        handoff_id, request_configs = split_pd_handoff_request_config(request_configs)
         # Serialize against the store-worker thread's
         with self._engine_state_lock:
-            return super().lookup(
-                tokens=tokens,
-                hashes=hashes,
-                offsets=offsets,
-                search_range=search_range,
-                lookup_id=lookup_id,
-                pin=pin,
-                request_configs=request_configs,
-            )
+            if pin:
+                self._promote_pd_handoff_lease(handoff_id, lookup_id)
+            token = None
+            if self._is_pd_receiver() and pin and lookup_id is not None:
+                from lmcache_ascend.v1.storage_backend.storage_manager import (
+                    set_current_pd_lookup_id,
+                )
+
+                token = set_current_pd_lookup_id(lookup_id)
+            try:
+                return super().lookup(
+                    tokens=tokens,
+                    hashes=hashes,
+                    offsets=offsets,
+                    search_range=search_range,
+                    lookup_id=lookup_id,
+                    pin=pin,
+                    request_configs=request_configs,
+                )
+            finally:
+                if token is not None:
+                    from lmcache_ascend.v1.storage_backend.storage_manager import (
+                        reset_current_pd_lookup_id,
+                    )
+
+                    reset_current_pd_lookup_id(token)
 
     def lookup_unpin(self, lookup_id: str) -> None:
         with self._engine_state_lock:
-            super().lookup_unpin(lookup_id)
+            try:
+                super().lookup_unpin(lookup_id)
+            finally:
+                self._release_pd_request_lease(lookup_id)
 
     @torch.inference_mode()
     def store(
@@ -1097,6 +1230,11 @@ class AscendLMCacheEngine(LMCacheEngine):
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
+        # PD handoff metadata is control-plane state, not a cache namespace.
+        # Strip it before any synchronous or asynchronous store path captures
+        # kwargs for token hashing.
+        self._extract_pd_handoff_from_kwargs(kwargs)
+
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store operation")

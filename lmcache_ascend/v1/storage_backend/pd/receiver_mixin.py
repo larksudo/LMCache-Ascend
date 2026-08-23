@@ -175,10 +175,32 @@ class AscendPDReceiverMixin:
         send the ack on the REP socket first, then invoke the callback
         (if not ``None``) to send the ``PullDoneSignal``.
         """
-        if not self.delay_pull:
-            return self._handle_pull_eager(msg, sender_id)
-        else:
+        if not msg.handoff_id:
+            logger.error(
+                "Pull mode: rejecting PullReady without handoff_id "
+                "(sender=%s pull_id=%s). Update the prefiller and proxy "
+                "together with the receiver.",
+                sender_id,
+                msg.pull_id,
+            )
+            return PullReadyDoneAck(already_sent_indexes=[], alloc_failed=True), None
+
+        try:
+            if not self.delay_pull:
+                return self._handle_pull_eager(msg, sender_id)
             return self._handle_pull_delay(msg, sender_id)
+        except Exception as e:
+            # Keep REP/REQ synchronized with a typed response.  The partition
+            # helper already rolls back partial reservations; this is also safe
+            # when no handoff lease was installed.
+            self.release_handoff_lease(msg.handoff_id)
+            logger.error(
+                "Pull mode: failed to handle PullReady sender=%s pull_id=%s: %s",
+                sender_id,
+                msg.pull_id,
+                e,
+            )
+            return PullReadyDoneAck(already_sent_indexes=[], alloc_failed=True), None
 
     def _handle_pull_eager(
         self, msg: PullReadyNotif, sender_id: str
@@ -204,8 +226,8 @@ class AscendPDReceiverMixin:
             dtype = STR_DTYPE_TO_TORCH_DTYPE[msg.dtype]
             shape = list(msg.shape)
 
-        already_sent_indexes, already_sent_objs, new_indexes = self._partition_keys(
-            msg.keys
+        already_sent_indexes, already_sent_objs, new_indexes = (
+            self._partition_keys_with_handoff(msg.keys, msg.handoff_id)
         )
 
         remote_buffer_uuids: list[str] = []
@@ -253,6 +275,7 @@ class AscendPDReceiverMixin:
                 )
                 # release the mem objs + sent
                 release_memory_objects(mem_objs + already_sent_objs)
+                self.release_handoff_lease(msg.handoff_id)
                 return (
                     PullReadyDoneAck(
                         already_sent_indexes=already_sent_indexes,
@@ -271,17 +294,55 @@ class AscendPDReceiverMixin:
             remote_buffer_uuids,
             remote_mem_indexes,
         )
-        self.transfer_channel.batched_read(
-            buffers=mem_objs,
-            transfer_spec=channel_transfer_spec,
-        )
+        inserted_objs: list[MemoryObj] = []
+        collision_objs: list[MemoryObj] = []
+        collision_pins: list[MemoryObj] = []
+        try:
+            self.transfer_channel.batched_read(
+                buffers=mem_objs,
+                transfer_spec=channel_transfer_spec,
+            )
 
-        # batched_read() synchronizes the transport stream, so all RDMA
-        # reads are complete at this point.  Store the received data.
-        for mem_obj, key in zip(mem_objs, mem_keys, strict=False):
-            self.put(key, mem_obj)
+            # batched_read() synchronizes the transport stream, so all RDMA
+            # reads are complete at this point.  Publish each object together
+            # with its handoff lease; there is no visibility-without-owner gap.
+            for msg_idx, mem_obj, key in zip(
+                new_indexes, mem_objs, mem_keys, strict=False
+            ):
+                inserted, existing_pin = self.put_with_handoff_lease(
+                    key, mem_obj, msg.handoff_id
+                )
+                if inserted:
+                    inserted_objs.append(mem_obj)
+                    continue
 
-        release_memory_objects(already_sent_objs)
+                already_sent_indexes.append(msg_idx)
+                collision_objs.append(mem_obj)
+                if existing_pin is not None:
+                    collision_pins.append(existing_pin)
+        except Exception as e:
+            logger.error(
+                "Pull-eager: failed to receive/publish pull_id %s: %s",
+                msg.pull_id,
+                e,
+            )
+            # Objects already inserted are owned and freed by lease rollback.
+            self.release_handoff_lease(msg.handoff_id)
+            inserted_obj_ids = {id(obj) for obj in inserted_objs}
+            release_memory_objects(
+                [obj for obj in mem_objs if id(obj) not in inserted_obj_ids]
+                + already_sent_objs
+                + collision_pins
+            )
+            return (
+                PullReadyDoneAck(
+                    already_sent_indexes=already_sent_indexes,
+                    alloc_failed=True,
+                ),
+                None,
+            )
+
+        release_memory_objects(already_sent_objs + collision_pins + collision_objs)
 
         # Build a callback that sends PullDoneSignal AFTER the ack reply
         # has been sent on the REP socket.  This prevents the sender's
@@ -321,9 +382,63 @@ class AscendPDReceiverMixin:
         callback exactly once.  The sender's ``_pull_done_listener_loop``
         receives it and releases the pinned MemObjs.
         """
-        already_sent_indexes, already_sent_objs, new_indexes = self._partition_keys(
-            msg.keys
+        already_sent_indexes, already_sent_objs, new_indexes = (
+            self._partition_keys_with_handoff(msg.keys, msg.handoff_id)
         )
+
+        if already_sent_indexes:
+            first_already_index = already_sent_indexes[0]
+            first_already_key = CacheEngineKey.from_string(
+                msg.keys[first_already_index]
+            )
+            entry_present = False
+            owners: tuple[str, ...] = ()
+            pending_delete = False
+            context_id = "-"
+            context_done = False
+            active_leases = -1
+            with self.data_lock:
+                entry = self._pd_entries.get(first_already_key)
+                if entry is not None:
+                    entry_present = True
+                    owners = tuple(sorted(entry.owners))
+                    pending_delete = entry.pending_delete
+                    if isinstance(entry.base_obj, ProxyMemoryObj):
+                        transfer_context = entry.base_obj.transfer_context
+                        context_id = hex(id(transfer_context))
+                        context_done = getattr(
+                            transfer_context, "_done_sent", False
+                        )
+                        active_leases = getattr(
+                            transfer_context, "_active_lease_count", -1
+                        )
+
+            logger.info(
+                "PD_LIFETIME_DIAG event=pull_ready_already_sent "
+                "rank=%s pull_id=%s handoff=%s sender=%s "
+                "total=%d already=%d new=%d "
+                "first_already_index=%d first_already_key=%s "
+                "first_already_key_hash=%s "
+                "entry_present=%s owners=%s pending_delete=%s context=%s "
+                "context_done=%s active_leases=%d mono_ns=%d",
+                self.tp_rank,
+                msg.pull_id,
+                msg.handoff_id,
+                sender_id,
+                len(msg.keys),
+                len(already_sent_indexes),
+                len(new_indexes),
+                first_already_index,
+                first_already_key.to_string(),
+                first_already_key.chunk_hash_hex,
+                entry_present,
+                owners,
+                pending_delete,
+                context_id,
+                context_done,
+                active_leases,
+                time.monotonic_ns(),
+            )
 
         num_proxies = len(new_indexes)
 
@@ -365,43 +480,66 @@ class AscendPDReceiverMixin:
                 fmt=fmt,
             )
 
-            for proxy_seq, msg_idx in enumerate(new_indexes):
-                key = CacheEngineKey.from_string(msg.keys[msg_idx])
+            collision_pins: list[MemoryObj] = []
+            try:
+                for proxy_seq, msg_idx in enumerate(new_indexes):
+                    key = CacheEngineKey.from_string(msg.keys[msg_idx])
 
-                if num_groups > 1:
-                    proxy_shapes = _multi_group_shapes_for_chunk(
-                        self._metadata,
-                        msg_idx,
-                        total_allocs,
-                        msg.last_chunk_toks,
-                    )
-                    proxy_dtypes = dtypes
-                else:
-                    alloc_shape = adjust_last_chunk_shape(
-                        shape,
-                        msg_idx,
-                        total_allocs,
-                        fmt,
-                        msg.last_chunk_toks,
-                    )
-                    proxy_shapes, proxy_dtypes = (
-                        [torch.Size(alloc_shape)],
-                        self._kv_dtypes,
-                    )
+                    if num_groups > 1:
+                        proxy_shapes = _multi_group_shapes_for_chunk(
+                            self._metadata,
+                            msg_idx,
+                            total_allocs,
+                            msg.last_chunk_toks,
+                        )
+                        proxy_dtypes = dtypes
+                    else:
+                        alloc_shape = adjust_last_chunk_shape(
+                            shape,
+                            msg_idx,
+                            total_allocs,
+                            fmt,
+                            msg.last_chunk_toks,
+                        )
+                        proxy_shapes, proxy_dtypes = (
+                            [torch.Size(alloc_shape)],
+                            self._kv_dtypes,
+                        )
 
-                proxy = ProxyMemoryObj(
-                    backing_obj=None,
-                    transfer_channel=self.transfer_channel,
-                    target_peer_url=sender_id,
-                    remote_buffer_uuid=msg.sender_buffer_uuids[msg_idx],
-                    remote_mem_index=msg.sender_mem_indexes[msg_idx],
-                    transfer_context=transfer_context,
-                    chunk_index=proxy_seq,
-                    shapes=proxy_shapes,
-                    dtypes=proxy_dtypes,
-                    fmt=self._fmt,
+                    proxy = ProxyMemoryObj(
+                        backing_obj=None,
+                        transfer_channel=self.transfer_channel,
+                        target_peer_url=sender_id,
+                        remote_buffer_uuid=msg.sender_buffer_uuids[msg_idx],
+                        remote_mem_index=msg.sender_mem_indexes[msg_idx],
+                        transfer_context=transfer_context,
+                        chunk_index=proxy_seq,
+                        shapes=proxy_shapes,
+                        dtypes=proxy_dtypes,
+                        fmt=self._fmt,
+                    )
+                    inserted, existing_pin = self.put_with_handoff_lease(
+                        key, proxy, msg.handoff_id
+                    )
+                    if not inserted:
+                        already_sent_indexes.append(msg_idx)
+                        if existing_pin is not None:
+                            collision_pins.append(existing_pin)
+            except Exception as e:
+                logger.error(
+                    "Pull-delay: failed to publish pull_id %s: %s",
+                    msg.pull_id,
+                    e,
                 )
-                self.put(key, proxy)
+                self.release_handoff_lease(msg.handoff_id)
+                release_memory_objects(already_sent_objs + collision_pins)
+                return (
+                    PullReadyDoneAck(
+                        already_sent_indexes=already_sent_indexes,
+                        alloc_failed=True,
+                    ),
+                    None,
+                )
 
             logger.debug(
                 "Pull mode: created %d proxies for pull_id %s from sender %s.",
@@ -409,6 +547,8 @@ class AscendPDReceiverMixin:
                 msg.pull_id,
                 sender_id,
             )
+
+            release_memory_objects(collision_pins)
 
         release_memory_objects(already_sent_objs)
 
@@ -467,6 +607,7 @@ class AscendPDReceiverMixin:
         self.alloc_side_channel.setsockopt(zmq.RCVTIMEO, 1000)
 
         while self.running:
+            self.release_expired_handoff_leases()
             try:
                 msg_bytes = self.alloc_side_channel.recv()
             except zmq.Again:

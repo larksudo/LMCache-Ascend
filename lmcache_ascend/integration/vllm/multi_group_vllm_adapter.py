@@ -627,6 +627,13 @@ class LMCacheConnectorV1ImplMultiGroup(LMCacheConnectorV1Impl):
         force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
 
         meta = LMCacheConnectorMetadata()
+        # Surface this step's preempted requests so worker-side
+        # handle_preemptions() can recover the ids from the metadata on
+        # newer vLLM versions (older vLLM has no preempted_req_ids on
+        # SchedulerOutput, hence the defensive getattr).
+        meta.preempted_req_ids = set(
+            getattr(scheduler_output, "preempted_req_ids", None) or ()
+        )
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self._request_trackers.pop(finished_req_id, None)
