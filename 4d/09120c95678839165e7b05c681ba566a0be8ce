@@ -1,0 +1,46 @@
+csrc/hccl/CMakeLists.txt
+  h_dffb05a36fbb51 4-11,21-24
+lmcache_ascend/v1/storage_backend/pd/sender_mixin.py
+  h_dffb05a36fbb51 539-542,582,616-619
+lmcache_ascend/v1/transfer_context.py
+  h_dffb05a36fbb51 357-358,370-426
+lmcache_ascend/v1/storage_backend/pd/handoff.py
+  h_dffb05a36fbb51 1-33
+lmcache_ascend/v1/storage_backend/pd/messages.py
+  h_dffb05a36fbb51 57-59
+lmcache_ascend/v1/storage_backend/storage_manager.py
+  h_dffb05a36fbb51 67,84-89,91-106,118-121,123,157,162,200-210,237-272
+lmcache_ascend/v1/storage_backend/pd/backend.py
+  h_dffb05a36fbb51 11,14,36-38,47-49,51-55,57,92-99,301-302,305,307,335-752,754-784,817-862
+examples/disagg_prefill/1p1d/disagg_proxy_server.py
+  h_dffb05a36fbb51 1-1699
+tests/integration/vllm/test_handle_preemptions.py
+  h_dffb05a36fbb51 3,5,48-134,163-165,195,197-216
+lmcache_ascend/v1/storage_backend/pd/receiver_mixin.py
+  h_dffb05a36fbb51 178-190,192-203,229-230,278,297-300,307-310,312-342,345,385-386,389-441,483-484,487,490-494,498,500-513,517-519,521-522,524-541,551,610
+lmcache_ascend/__init__.py
+  h_dffb05a36fbb51 203-213,450-451,464,645-657
+lmcache_ascend/v1/proxy_memory_obj.py
+  h_dffb05a36fbb51 18,92-97,143-144,146-168,470-473,478-483,485-489
+csrc/hixl/CMakeLists.txt
+  h_dffb05a36fbb51 19
+lmcache_ascend/integration/vllm/vllm_v1_adapter.py
+  h_dffb05a36fbb51 3,12,35,56-62,88-101,529-532,647-660,662
+docs/deepseek_v4/dsv4-deployment-guide.md
+  h_dffb05a36fbb51 89
+tests/v1/storage_backend/test_ascend_pd_backend.py
+  h_dffb05a36fbb51 11,105-108,110,142-188,221,307,321,345,363,377-412,490,514-517,540,583,602-605,627,644-645,649-652,659-685,687-789,1012-1015
+lmcache_ascend/v1/cache_engine.py
+  h_dffb05a36fbb51 31-33,127-170,667-695,709,714,1168,1171-1180,1189-1196,1200-1203,1233-1237
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "4d09120c95678839165e7b05c681ba566a0be8ce",
+  "prompts": {},
+  "humans": {
+    "h_dffb05a36fbb51": {
+      "author": "sunshine <1163852160@qq.com>"
+    }
+  }
+}
