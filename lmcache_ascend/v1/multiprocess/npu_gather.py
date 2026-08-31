@@ -61,6 +61,16 @@ per-chunk D2H/H2D copies are issued ``non_blocking`` on that stream so N host
 syncs collapse to one. Unsupported layouts (and CPU/310P workers) fall back to the
 original upstream methods unchanged.
 
+Finally, ``install_overrides`` also wires the **LMCache-driven** MP path (the
+block-level object-group transfer of the MP-mode design doc section 6.1) when
+the compiled block kernels are present: it rebinds the upstream
+``lmcache_driven_transfer`` module's ``transfer_kv_per_object_group`` to the
+Ascend port and registers the NPU KV-wrapper factory, so
+``LMCACHE_MP_TRANSFER_MODE=lmcache_driven`` (or the ``lmcache.mp.mp_transfer_mode``
+extra config) selects the server-driven block-level path while ``auto`` /
+``engine_driven`` keep the token-level fused path above unchanged. See
+:func:`_install_lmcache_driven_overrides`.
+
 Heavy dependencies (``c_ops``, the NPU connector helpers) are imported lazily
 so the module and its pure-Python helpers stay importable on hosts without a
 built extension — this keeps the slot-mapping and fallback logic unit-testable.
@@ -362,6 +372,29 @@ _offsets_cache: dict[int, torch.Tensor] = {}
 #: single kernel launch.
 _STAGING_CAP_BYTES = 1 << 30  # 1 GiB
 
+#: Feature flag for the LMCache-driven block-level MP path (design doc 6.1).
+#: ``None`` until the first probe; resolved lazily so this module stays
+#: importable on hosts without the Ascend extension. Delegates to
+#: :data:`lmcache_ascend.v1.multiprocess.npu_driven_transfer._HAS_NATIVE_OBJECT_GROUP_TRANSFER`
+#: (upstream's identity check against ``python_ops_fallback`` — ``_patch_ops``
+#: merges the raising fallback into the Ascend ``c_ops`` when the block
+#: kernels are absent, so a bare ``hasattr`` probe would mis-fire).
+_HAS_NATIVE_OBJECT_GROUP_TRANSFER: Optional[bool] = None
+
+
+def _native_object_group_transfer_available() -> bool:
+    """Resolve :data:`_HAS_NATIVE_OBJECT_GROUP_TRANSFER` once, then cache."""
+    global _HAS_NATIVE_OBJECT_GROUP_TRANSFER
+    if _HAS_NATIVE_OBJECT_GROUP_TRANSFER is None:
+        # First Party — lazy: npu_driven_transfer is importable on any host
+        # (its own c_ops import is guarded).
+        from lmcache_ascend.v1.multiprocess.npu_driven_transfer import (
+            _HAS_NATIVE_OBJECT_GROUP_TRANSFER as flag,
+        )
+
+        _HAS_NATIVE_OBJECT_GROUP_TRANSFER = bool(flag)
+    return _HAS_NATIVE_OBJECT_GROUP_TRANSFER
+
 
 def _dtype_elem_size(dtype: torch.dtype) -> int:
     """Element size in bytes for ``dtype`` (wraps ``torch.empty`` for any dtype)."""
@@ -637,6 +670,69 @@ _orig_submit_retrieve: Optional[object] = None
 # can correct the Ascend MLA/DSA chunk-shape contract and pass every other case
 # through unchanged.
 _orig_compute_kv_layout: Optional[object] = None
+# LMC-A: original of the upstream LMCache-driven transfer entry point,
+# saved so the block-level NPU port can be installed idempotently (and so
+# tests / future fallbacks can restore the upstream behaviour).
+_orig_lmcache_driven_transfer_fn: Optional[object] = None
+
+
+def _install_lmcache_driven_overrides() -> None:
+    """Wire the LMCache-driven block-level MP path for NPU (design doc 6.1).
+
+    Two registrations behind the ``_HAS_NATIVE_OBJECT_GROUP_TRANSFER``
+    feature flag; without the compiled block kernels both are skipped and
+    upstream behaves exactly as today (``auto`` / ``engine_driven`` keep the
+    token-level fused path; ``lmcache_driven`` raises upstream's clear
+    "no KV-cache wrapper factory" error):
+
+    * **Server side** — upstream ``LMCacheDrivenTransferModule``'s STORE /
+      RETRIEVE handlers resolve ``transfer_kv_per_object_group`` from their
+      module globals at call time, so rebinding it in the
+      ``lmcache_driven_transfer`` namespace redirects every call to the
+      Ascend port (block-level plan fast path + per-batch fallback). The
+      port resolves ``lmcache_ascend.c_ops`` by its own name, immune to the
+      ``sys.modules["lmcache.c_ops"]`` swap ordering (see
+      :mod:`npu_driven_transfer`'s module docstring).
+    * **Worker side** — register the NPU KV-wrapper factory
+      (:class:`AscendIPCWrapper`) in the platform registry so
+      ``create_transfer_context(mode=lmcache_driven)`` can build
+      ``LMCacheDrivenTransferContext`` for NPU kv_caches
+      (``wrap_one_kv_cache`` → ``get_kv_wrapper_factory("npu")``). Selection
+      stays upstream's contract: ``LMCACHE_MP_TRANSFER_MODE=lmcache_driven``
+      or the ``lmcache.mp.mp_transfer_mode`` extra config; ``auto`` (the
+      default) keeps routing NPU to the engine-driven token-level path.
+    """
+    if not _native_object_group_transfer_available():
+        logger.info(
+            "LMCache-driven NPU block transfer not installed: "
+            "lmcache_ascend.c_ops lacks execute_object_group_transfer"
+        )
+        return
+
+    # Third Party
+    from lmcache.v1.platform import _registry as platform_registry
+
+    # First Party
+    from lmcache_ascend.v1.multiprocess import npu_driven_transfer
+    from lmcache_ascend.v1.multiprocess.custom_types import AscendIPCWrapper
+
+    # Third Party
+    import lmcache.v1.multiprocess.modules.lmcache_driven_transfer as ldt
+
+    global _orig_lmcache_driven_transfer_fn
+    if _orig_lmcache_driven_transfer_fn is None:
+        _orig_lmcache_driven_transfer_fn = ldt.transfer_kv_per_object_group
+    ldt.transfer_kv_per_object_group = (  # type: ignore[assignment]
+        npu_driven_transfer.transfer_kv_per_object_group
+    )
+
+    # Idempotent: register_kv_wrapper overwrites with the same class.
+    platform_registry.register_kv_wrapper("npu", AscendIPCWrapper)
+
+    logger.info(
+        "Installed NPU block-level LMCache-driven MP transfer "
+        "(enable via LMCACHE_MP_TRANSFER_MODE=lmcache_driven)"
+    )
 
 
 def _gather_wrapper(
@@ -909,7 +1005,10 @@ def install_overrides() -> None:
 
     Finally patches ``compute_kv_layout`` (on ``base`` and ``worker_transfer``)
     so the SHM server allocates the rank-3 buffer the fused MLA/DSA kernel
-    consumes; see :func:`_compute_kv_layout_wrapper`.
+    consumes; see :func:`_compute_kv_layout_wrapper`, and wires the
+    LMCache-driven block-level MP path via
+    :func:`_install_lmcache_driven_overrides` (no-op without the compiled block
+    kernels).
     """
     global _orig_gather
     global _orig_scatter
@@ -948,6 +1047,11 @@ def install_overrides() -> None:
         _orig_compute_kv_layout = base.compute_kv_layout
     base.compute_kv_layout = _compute_kv_layout_wrapper  # type: ignore[assignment]
     wt.compute_kv_layout = _compute_kv_layout_wrapper  # type: ignore[assignment]
+
+    # LMC-A: wire the LMCache-driven block-level MP path (design doc 6.1).
+    # No-op without the compiled block kernels, so this stays safe on hosts
+    # where the extension lacks execute_object_group_transfer.
+    _install_lmcache_driven_overrides()
 
     logger.info(
         "Installed NPU fused gather/scatter + transfer-stream submit override "
