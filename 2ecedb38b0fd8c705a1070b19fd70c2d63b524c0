@@ -1,0 +1,34 @@
+tests/v1/test_mem_kernels.py
+  h_dffb05a36fbb51 2,5,15-17,19-28,31-34,1555-1557,1730,1749-1750,1826,1850-1851
+.github/workflows/build-and-test.yml
+  h_dffb05a36fbb51 6-7
+lmcache_ascend/integration/vllm/lmcache_ascend_connector.py
+  h_dffb05a36fbb51 4,7,10,27
+.github/workflows/code-quality.yml
+  h_dffb05a36fbb51 13
+lmcache_ascend/integration/vllm/multi_spec_flatten.py
+  h_dffb05a36fbb51 4,7,11,14,258
+lmcache_ascend/integration/vllm/multi_group_vllm_adapter.py
+  h_dffb05a36fbb51 13,19,21,24,34-37,40,229,362
+tests/v1/conftest_ds4.py
+  h_dffb05a36fbb51 4,7,13,24,37,206,470,536,553
+lmcache_ascend/integration/vllm/skip_state_groups.py
+  h_dffb05a36fbb51 4,7,12,173,211-212
+tests/v1/test_ds4_kvcache_roundtrip.py
+  h_dffb05a36fbb51 4,7,11,16,37,69,107-108,136-137
+.github/workflows/perf-and-accuracy.yml
+  h_dffb05a36fbb51 6-7
+tests/v1/test_npu_connector_mixed_format.py
+  h_dffb05a36fbb51 4,7,11,21,268-269,273,419-420
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "2ecedb38b0fd8c705a1070b19fd70c2d63b524c0",
+  "prompts": {},
+  "humans": {
+    "h_dffb05a36fbb51": {
+      "author": "sunshine <1163852160@qq.com>"
+    }
+  }
+}

@@ -1,0 +1,52 @@
+docs/deployment.md
+  h_dffb05a36fbb51 14,19-27,29-33,35-43
+lmcache_ascend/integration/vllm/multi_group_vllm_adapter.py
+  h_dffb05a36fbb51 13,19,21,24,34-37,40,229,362,541
+tests/v1/conftest_kvcache.py
+  h_dffb05a36fbb51 360
+.github/workflows/code-quality.yml
+  h_dffb05a36fbb51 13
+tests/v1/test_ds4_kvcache_roundtrip.py
+  h_dffb05a36fbb51 4,7,11,16,37,69,73,108-109,137-138
+tests/v1/test_npu_connector_mixed_format.py
+  h_dffb05a36fbb51 4,7,11,21,268-269,273,419-420
+tests/v1/conftest_ds4.py
+  h_dffb05a36fbb51 4,7,13,24,37,206,470,536,553
+docker/mindspore/Dockerfile.310p.openEuler
+  h_dffb05a36fbb51 29
+csrc/mem_kernels.cpp
+  h_dffb05a36fbb51 457-458
+lmcache_ascend/integration/vllm/multi_spec_flatten.py
+  h_dffb05a36fbb51 4,7,11,14,258
+lmcache_ascend/integration/vllm/lmcache_ascend_connector.py
+  h_dffb05a36fbb51 4,7,10,27
+.github/workflows/perf-and-accuracy.yml
+  h_dffb05a36fbb51 6-7
+tests/v1/test_mem_kernels.py
+  h_dffb05a36fbb51 2,5,15-17,19-28,31-34,1555-1557,1730,1749-1750,1826,1850-1851
+lmcache_ascend/integration/vllm/skip_state_groups.py
+  h_dffb05a36fbb51 4,7,12,173,211-212
+.github/workflows/build-and-test.yml
+  h_dffb05a36fbb51 6-7
+docker/Dockerfile.310p.openEuler
+  h_dffb05a36fbb51 30
+lmcache_ascend/v1/npu_connector/npu_connectors.py
+  h_dffb05a36fbb51 766
+docs/deepseek_v4/dsv4-deployment-guide.md
+  h_dffb05a36fbb51 1-2,5-7,25,27-28,30-46,50-51,53-60,68-70,72,82,113-114,116,119-120,123-124,128-130,137,140-142,148-149,154,157-158,160,163-164,170-171,175-177,184,187-189,192-193,195-197,213,249
+csrc/utils.cpp
+  h_dffb05a36fbb51 74
+docker/mindspore/Dockerfile.a2.openEuler
+  h_dffb05a36fbb51 29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "2aa3c0425f8d6387536001ede54772eee35679c6",
+  "prompts": {},
+  "humans": {
+    "h_dffb05a36fbb51": {
+      "author": "sunshine <1163852160@qq.com>"
+    }
+  }
+}

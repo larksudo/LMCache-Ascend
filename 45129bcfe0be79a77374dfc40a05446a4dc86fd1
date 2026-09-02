@@ -1,0 +1,20 @@
+lmcache_ascend/integration/vllm/vllm_v1_adapter.py
+  h_dffb05a36fbb51 811-840
+lmcache_ascend/integration/vllm/multi_group_vllm_adapter.py
+  h_dffb05a36fbb51 13,19,21,24,34,36-37,40,229,362,494-495,798-807
+lmcache_ascend/integration/vllm/lmcache_ascend_connector.py
+  h_dffb05a36fbb51 4,7,10,27
+.github/workflows/build-and-test.yml
+  h_dffb05a36fbb51 9-15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "45129bcfe0be79a77374dfc40a05446a4dc86fd1",
+  "prompts": {},
+  "humans": {
+    "h_dffb05a36fbb51": {
+      "author": "sunshine <1163852160@qq.com>"
+    }
+  }
+}
