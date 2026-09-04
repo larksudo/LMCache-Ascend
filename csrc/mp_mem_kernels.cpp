@@ -2,12 +2,6 @@
 
 // C++ host layer for the block-level MP-mode KV transfer (mirrors upstream
 // LMCache csrc/mp_mem_kernels.cu).
-//
-// Phase 1 (design doc 4.5): the upstream multi-object batch is consumed at
-// this boundary — one device-kernel launch per LMCache object, with the
-// engine_block_ids array sliced by i * num_blocks_per_object. The pybind
-// surface stays identical to upstream so the Python orchestration layer
-// ports over verbatim.
 
 #include "mp_mem_kernels.h"
 
@@ -19,7 +13,7 @@
 namespace {
 
 // DataCopy granularity on the GM side: segment base addresses and segment
-// byte lengths must both be multiples of 32B (design doc 4.2).
+// byte lengths must both be multiples of 32B.
 constexpr int64_t kGmAlignBytes = 32;
 // UB budget assumed by the device kernel: the depth-2 queue must fit two
 // token segments, so a single token's bytes may not exceed half of it.
