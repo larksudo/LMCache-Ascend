@@ -1,0 +1,14 @@
+csrc/mp_mem_kernels.cpp
+  h_dffb05a36fbb51 16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "de2afcbbd659c0fc71e1c32c26037dbef2d713cb",
+  "prompts": {},
+  "humans": {
+    "h_dffb05a36fbb51": {
+      "author": "sunshine <1163852160@qq.com>"
+    }
+  }
+}
