@@ -1,0 +1,16 @@
+csrc/mp_mem_kernels.cpp
+  h_dffb05a36fbb51 16
+csrc/hccl/CMakeLists.txt
+  h_dffb05a36fbb51 4-11,21-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "0e0e9b21957c1441a81ffba6ff23ec29c7716add",
+  "prompts": {},
+  "humans": {
+    "h_dffb05a36fbb51": {
+      "author": "sunshine <1163852160@qq.com>"
+    }
+  }
+}
