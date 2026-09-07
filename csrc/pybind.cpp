@@ -5,6 +5,7 @@
 #include "managed_mem.h"
 #include "mem_alloc.h"
 #include "mem_kernels.h"
+#include "mp_mem_kernels.h"
 #include "pac_kernels.h"
 #include "pos_kernels.h"
 #include <iostream>
@@ -90,4 +91,101 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("pac_prepare_enc_metadata", &pac_prepare_enc_metadata);
   m.def("pac_encode", &pac_encode);
   m.def("pac_decode", &pac_decode);
+
+  // Block-level MP-mode KV transfer (mirrors upstream mp_mem_kernels.cuh).
+  py::enum_<TransferDirection>(m, "TransferDirection")
+      .value("H2D", TransferDirection::H2D)
+      .value("D2H", TransferDirection::D2H)
+      .export_values();
+  py::enum_<EngineKVFormat>(m, "EngineKVFormat")
+      .value("NB_NL_TWO_BS_NH_HS", EngineKVFormat::NB_NL_TWO_BS_NH_HS)
+      .value("NL_X_TWO_NB_BS_NH_HS", EngineKVFormat::NL_X_TWO_NB_BS_NH_HS)
+      .value("NL_X_NB_TWO_BS_NH_HS", EngineKVFormat::NL_X_NB_TWO_BS_NH_HS)
+      .value("NL_X_NB_BS_HS", EngineKVFormat::NL_X_NB_BS_HS)
+      .value("TWO_X_NL_X_NBBS_NH_HS", EngineKVFormat::TWO_X_NL_X_NBBS_NH_HS)
+      .value("NL_X_NBBS_ONE_HS", EngineKVFormat::NL_X_NBBS_ONE_HS)
+      .value("NL_X_TWO_NB_NH_BS_HS", EngineKVFormat::NL_X_TWO_NB_NH_BS_HS)
+      .value("NL_X_NB_TWO_NH_BS_HS", EngineKVFormat::NL_X_NB_TWO_NH_BS_HS)
+      .value("NB_NL_TWO_NH_BS_HS", EngineKVFormat::NB_NL_TWO_NH_BS_HS)
+      .value("TWO_X_NL_X_NB_BS_NH_HS", EngineKVFormat::TWO_X_NL_X_NB_BS_NH_HS)
+      .value("NL_X_NB_NH_BS_TWO_HS", EngineKVFormat::NL_X_NB_NH_BS_TWO_HS)
+      .value("NL_X_TWO_X_NB_BS_NH_HS",
+             EngineKVFormat::NL_X_TWO_X_NB_BS_NH_HS)
+      .export_values();
+  // Format classification, shared with the host entry points.
+  m.def("is_cross_layer", [](EngineKVFormat f) { return is_cross_layer(f); },
+        py::arg("engine_kv_format"));
+  m.def("is_kv_list", [](EngineKVFormat f) { return is_kv_list(f); },
+        py::arg("engine_kv_format"));
+  m.def("is_layer_list", [](EngineKVFormat f) { return is_layer_list(f); },
+        py::arg("engine_kv_format"));
+  m.def("is_mla", [](EngineKVFormat f) { return is_mla(f); },
+        py::arg("engine_kv_format"));
+  m.def("is_kv_second_tuple",
+        [](EngineKVFormat f) { return is_kv_second_tuple(f); },
+        py::arg("engine_kv_format"));
+  m.def("multi_layer_block_kv_transfer", &multi_layer_block_kv_transfer,
+        py::arg("paged_buffer_ptrs_tensor"), py::arg("lmcache_objects_ptrs"),
+        py::arg("block_ids"), py::arg("device"), py::arg("direction"),
+        py::arg("shape_desc"), py::arg("lmcache_chunk_size"),
+        py::arg("engine_kv_format"), py::arg("skip_prefix_n_blocks"),
+        py::call_guard<py::gil_scoped_release>());
+  py::class_<PageBufferShapeDesc>(m, "PageBufferShapeDesc")
+      .def(py::init<>())
+      .def_readwrite("kv_size", &PageBufferShapeDesc::kv_size)
+      .def_readwrite("nl", &PageBufferShapeDesc::nl)
+      .def_readwrite("nb", &PageBufferShapeDesc::nb)
+      .def_readwrite("bs", &PageBufferShapeDesc::bs)
+      .def_readwrite("nh", &PageBufferShapeDesc::nh)
+      .def_readwrite("hs", &PageBufferShapeDesc::hs)
+      .def_readwrite("element_size", &PageBufferShapeDesc::element_size)
+      .def_readwrite("block_stride_elems",
+                     &PageBufferShapeDesc::block_stride_elems);
+  // Object-group transfer plan types (see mp_mem_kernels.h). Built on the
+  // Python side and consumed by execute_object_group_transfer.
+  py::class_<StagingCopy>(m, "StagingCopy")
+      .def(py::init([](uintptr_t dest, uintptr_t src, size_t nbytes,
+                       size_t host_offset) {
+             return StagingCopy{dest, src, nbytes, host_offset};
+           }),
+           py::arg("dest"), py::arg("src"), py::arg("nbytes"),
+           py::arg("host_offset"));
+  py::class_<LaunchVar>(m, "LaunchVar")
+      .def(
+          py::init([](int group_idx, int64_t block_ids_offset, int total_blocks,
+                      int num_objects, int skip_prefix_n_blocks) {
+            return LaunchVar{group_idx, block_ids_offset, total_blocks,
+                             num_objects, skip_prefix_n_blocks};
+          }),
+          py::arg("group_idx"), py::arg("block_ids_offset"),
+          py::arg("total_blocks"), py::arg("num_objects"),
+          py::arg("skip_prefix_n_blocks"));
+  py::class_<BatchStep>(m, "BatchStep")
+      .def(py::init([](std::vector<StagingCopy> staging,
+                       std::vector<LaunchVar> launches) {
+             return BatchStep{std::move(staging), std::move(launches)};
+           }),
+           py::arg("staging"), py::arg("launches"));
+  py::class_<KernelGroupSpec>(m, "KernelGroupSpec")
+      .def(py::init([](uintptr_t paged_buffer_ptrs,
+                       std::vector<int64_t> lmcache_objects_ptrs,
+                       PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
+                       EngineKVFormat engine_kv_format,
+                       uintptr_t block_ids_base, int64_t block_ids_capacity) {
+             return KernelGroupSpec{
+                 paged_buffer_ptrs, std::move(lmcache_objects_ptrs),
+                 shape_desc,        lmcache_chunk_size,
+                 engine_kv_format,  block_ids_base,
+                 block_ids_capacity};
+           }),
+           py::arg("paged_buffer_ptrs"), py::arg("lmcache_objects_ptrs"),
+           py::arg("shape_desc"), py::arg("lmcache_chunk_size"),
+           py::arg("engine_kv_format"), py::arg("block_ids_base"),
+           py::arg("block_ids_capacity"));
+  m.def("execute_object_group_transfer", &execute_object_group_transfer,
+        py::arg("direction"), py::arg("device"),
+        py::arg("host_buffer_alignment"), py::arg("kernel_group_specs"),
+        py::arg("batch_steps"), py::call_guard<py::gil_scoped_release>());
+  m.def("lmcache_memcpy_async", &lmcache_memcpy_async,
+        py::call_guard<py::gil_scoped_release>());
 }

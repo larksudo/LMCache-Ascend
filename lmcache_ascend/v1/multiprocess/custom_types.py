@@ -5,6 +5,7 @@ import subprocess
 
 # Third Party
 from lmcache.v1.platform.cuda.ipc_wrapper import CudaIPCWrapper
+from lmcache.v1.platform.base_ipc_wrapper import DeviceIPCWrapper
 import torch
 
 
@@ -60,8 +61,13 @@ class AscendIPCWrapper(CudaIPCWrapper):
             if pci_match:
                 return f"{device_name}-{pci_match.group(1)}"
 
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            raise RuntimeError("Failed to retrieve device UUID from npu-smi.") from e
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # ``torch.npu.device_count()`` can expose logical chip ordinals,
+            # whereas this npu-smi board query accepts only physical-board
+            # ordinals.  Do not make discovery fail when enumerating a logical
+            # ordinal which npu-smi cannot query; both IPC peers can still use
+            # the stable process-local ordinal fallback below.
+            pass
 
         # 3. Final Fallback (Unlikely to be unique globally)
         return f"{device_name}-{device_index}"
@@ -111,3 +117,21 @@ class AscendIPCWrapper(CudaIPCWrapper):
         t = torch.empty((), device=device, dtype=self.dtype)
         t.set_(storage, self.storage_offset, self.shape, self.stride)
         return t
+
+
+class AscendKVPairIPCWrapper(DeviceIPCWrapper):
+    """IPC wrapper for one vLLM-Ascend layer's separate ``(K, V)`` entry.
+
+    The upstream LMCache MP adapter assumes a single tensor per model layer.
+    vLLM-Ascend exposes separate K and V tensors, so keeping both component
+    wrappers inside one serializable object preserves the layer boundary that
+    ``NPUCacheContext`` needs when it builds its interleaved pointer table.
+    """
+
+    def __init__(self, key_value: tuple[torch.Tensor, torch.Tensor]) -> None:
+        key, value = key_value
+        self.key_wrapper = AscendIPCWrapper(key)
+        self.value_wrapper = AscendIPCWrapper(value)
+
+    def to_tensor(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.key_wrapper.to_tensor(), self.value_wrapper.to_tensor()

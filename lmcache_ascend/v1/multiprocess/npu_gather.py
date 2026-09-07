@@ -61,6 +61,16 @@ per-chunk D2H/H2D copies are issued ``non_blocking`` on that stream so N host
 syncs collapse to one. Unsupported layouts (and CPU/310P workers) fall back to the
 original upstream methods unchanged.
 
+Finally, ``install_overrides`` also wires the **LMCache-driven** MP path (the
+block-level object-group transfer of the MP-mode design doc section 6.1) when
+the compiled block kernels are present: it rebinds the upstream
+``lmcache_driven_transfer`` module's ``transfer_kv_per_object_group`` to the
+Ascend port and registers the NPU KV-wrapper factory, so
+``LMCACHE_MP_TRANSFER_MODE=lmcache_driven`` (or the ``lmcache.mp.mp_transfer_mode``
+extra config) selects the server-driven block-level path while ``auto`` /
+``engine_driven`` keep the token-level fused path above unchanged. See
+:func:`_install_lmcache_driven_overrides`.
+
 Heavy dependencies (``c_ops``, the NPU connector helpers) are imported lazily
 so the module and its pure-Python helpers stay importable on hosts without a
 built extension — this keeps the slot-mapping and fallback logic unit-testable.
@@ -362,6 +372,29 @@ _offsets_cache: dict[int, torch.Tensor] = {}
 #: single kernel launch.
 _STAGING_CAP_BYTES = 1 << 30  # 1 GiB
 
+#: Feature flag for the LMCache-driven block-level MP path (design doc 6.1).
+#: ``None`` until the first probe; resolved lazily so this module stays
+#: importable on hosts without the Ascend extension. Delegates to
+#: :data:`lmcache_ascend.v1.multiprocess.npu_driven_transfer._HAS_NATIVE_OBJECT_GROUP_TRANSFER`
+#: (upstream's identity check against ``python_ops_fallback`` — ``_patch_ops``
+#: merges the raising fallback into the Ascend ``c_ops`` when the block
+#: kernels are absent, so a bare ``hasattr`` probe would mis-fire).
+_HAS_NATIVE_OBJECT_GROUP_TRANSFER: Optional[bool] = None
+
+
+def _native_object_group_transfer_available() -> bool:
+    """Resolve :data:`_HAS_NATIVE_OBJECT_GROUP_TRANSFER` once, then cache."""
+    global _HAS_NATIVE_OBJECT_GROUP_TRANSFER
+    if _HAS_NATIVE_OBJECT_GROUP_TRANSFER is None:
+        # First Party — lazy: npu_driven_transfer is importable on any host
+        # (its own c_ops import is guarded).
+        from lmcache_ascend.v1.multiprocess.npu_driven_transfer import (
+            _HAS_NATIVE_OBJECT_GROUP_TRANSFER as flag,
+        )
+
+        _HAS_NATIVE_OBJECT_GROUP_TRANSFER = bool(flag)
+    return _HAS_NATIVE_OBJECT_GROUP_TRANSFER
+
 
 def _dtype_elem_size(dtype: torch.dtype) -> int:
     """Element size in bytes for ``dtype`` (wraps ``torch.empty`` for any dtype)."""
@@ -637,6 +670,197 @@ _orig_submit_retrieve: Optional[object] = None
 # can correct the Ascend MLA/DSA chunk-shape contract and pass every other case
 # through unchanged.
 _orig_compute_kv_layout: Optional[object] = None
+# LMC-A: original of the upstream LMCache-driven transfer entry point,
+# saved so the block-level NPU port can be installed idempotently (and so
+# tests / future fallbacks can restore the upstream behaviour).
+_orig_lmcache_driven_transfer_fn: Optional[object] = None
+_orig_wrap_kv_caches: Optional[object] = None
+_orig_detect_device_type: Optional[object] = None
+_orig_cuda_future_methods: Optional[tuple[object, object, object]] = None
+
+
+def _npu_future_complete(self: object) -> None:
+    """Complete an MP future without CUDA-only NPU event IPC."""
+    if getattr(self, "_npu_result_ready", False):
+        return
+    _event_bytes, result = self.raw_future_.result()
+    self.result_ = result
+    self._npu_result_ready = True
+
+
+def _npu_future_query(self: object) -> bool:
+    if getattr(self, "_npu_result_ready", False):
+        return True
+    if not self.raw_future_.query():
+        return False
+    _npu_future_complete(self)
+    return True
+
+
+def _npu_future_wait(self: object, timeout: Optional[float] = None) -> bool:
+    if getattr(self, "_npu_result_ready", False):
+        return True
+    if not self.raw_future_.wait(timeout):
+        return False
+    _npu_future_complete(self)
+    return True
+
+
+def _wrap_npu_kv_caches(kv_caches: dict[str, object]) -> list[object]:
+    """Wrap Ascend per-layer K/V tuples without flattening their layers."""
+    # First Party
+    from lmcache_ascend.v1.multiprocess.custom_types import AscendKVPairIPCWrapper
+
+    # Third Party
+    from lmcache.integration.vllm.vllm_multi_process_adapter import (
+        wrap_one_kv_cache,
+    )
+
+    wrappers: list[object] = []
+    for layer_name, entry in kv_caches.items():
+        if isinstance(entry, (tuple, list)):
+            if (
+                len(entry) != 2
+                or not isinstance(entry[0], torch.Tensor)
+                or not isinstance(entry[1], torch.Tensor)
+            ):
+                raise TypeError(
+                    "NPU lmcache_driven transfer expects every tuple cache entry "
+                    f"to be a (K, V) tensor pair; layer {layer_name!r} has "
+                    f"{entry!r}"
+                )
+            wrappers.append(AscendKVPairIPCWrapper((entry[0], entry[1])))
+        elif isinstance(entry, torch.Tensor):
+            wrappers.append(wrap_one_kv_cache(entry))
+        else:
+            raise TypeError(
+                "NPU lmcache_driven transfer expects Tensor or (K, V) tensor "
+                f"entries; layer {layer_name!r} has {type(entry).__name__}"
+            )
+    return wrappers
+
+
+def _detect_npu_kv_cache_device_type(kv_caches: list[object]) -> str:
+    """Detect a device type when an Ascend layer materializes as ``(K, V)``.
+
+    Upstream performs ``wrapper.to_tensor().device.type`` for each layer.
+    The Ascend wrapper intentionally returns a K/V tuple to preserve the
+    vLLM-Ascend cache layout, so inspect every tensor in each materialized
+    layer instead.
+    """
+    device_types: set[str] = set()
+    for wrapper in kv_caches:
+        tensors = wrapper.to_tensor()  # type: ignore[union-attr]
+        if not isinstance(tensors, (tuple, list)):
+            tensors = (tensors,)
+        for tensor in tensors:
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    "KV cache wrapper materialized a non-Tensor value: "
+                    f"{type(tensor).__name__}"
+                )
+            device_types.add(tensor.device.type)
+
+    if len(device_types) != 1:
+        raise ValueError(
+            "create_cache_context requires all kv_caches to share one "
+            f"device type, got {sorted(device_types)!r}"
+        )
+    return next(iter(device_types))
+
+
+def _install_lmcache_driven_overrides() -> None:
+    """Wire the LMCache-driven block-level MP path for NPU (design doc 6.1).
+
+    Two registrations behind the ``_HAS_NATIVE_OBJECT_GROUP_TRANSFER``
+    feature flag; without the compiled block kernels both are skipped and
+    upstream behaves exactly as today (``auto`` / ``engine_driven`` keep the
+    token-level fused path; ``lmcache_driven`` raises upstream's clear
+    "no KV-cache wrapper factory" error):
+
+    * **Server side** — upstream ``LMCacheDrivenTransferModule``'s STORE /
+      RETRIEVE handlers resolve ``transfer_kv_per_object_group`` from their
+      module globals at call time, so rebinding it in the
+      ``lmcache_driven_transfer`` namespace redirects every call to the
+      Ascend port (block-level plan fast path + per-batch fallback). The
+      port resolves ``lmcache_ascend.c_ops`` by its own name, immune to the
+      ``sys.modules["lmcache.c_ops"]`` swap ordering (see
+      :mod:`npu_driven_transfer`'s module docstring).
+    * **Worker side** — register the NPU KV-wrapper factory
+      (:class:`AscendIPCWrapper`) in the platform registry so
+      ``create_transfer_context(mode=lmcache_driven)`` can build
+      ``LMCacheDrivenTransferContext`` for NPU kv_caches
+      (``wrap_one_kv_cache`` → ``get_kv_wrapper_factory("npu")``). Selection
+      stays upstream's contract: ``LMCACHE_MP_TRANSFER_MODE=lmcache_driven``
+      or the ``lmcache.mp.mp_transfer_mode`` extra config; ``auto`` (the
+      default) keeps routing NPU to the engine-driven token-level path.
+    """
+    if not _native_object_group_transfer_available():
+        logger.info(
+            "LMCache-driven NPU block transfer not installed: "
+            "lmcache_ascend.c_ops lacks execute_object_group_transfer"
+        )
+        return
+
+    # Third Party
+    from lmcache.v1.platform import _registry as platform_registry
+
+    # First Party
+    from lmcache_ascend.v1.multiprocess import npu_driven_transfer
+    from lmcache_ascend.v1.multiprocess.custom_types import AscendIPCWrapper
+
+    # Third Party
+    import lmcache.v1.multiprocess.modules.lmcache_driven_transfer as ldt
+
+    global _orig_lmcache_driven_transfer_fn
+    if _orig_lmcache_driven_transfer_fn is None:
+        _orig_lmcache_driven_transfer_fn = ldt.transfer_kv_per_object_group
+    ldt.transfer_kv_per_object_group = (  # type: ignore[assignment]
+        npu_driven_transfer.transfer_kv_per_object_group
+    )
+
+    # Idempotent: register_kv_wrapper overwrites with the same class.
+    platform_registry.register_kv_wrapper("npu", AscendIPCWrapper)
+
+    # vLLM-Ascend uses one ``(K, V)`` tuple per layer, while the upstream
+    # adapter assumes one tensor per layer. Keep each pair together across
+    # IPC so NPUCacheContext receives the structure it expects.
+    from lmcache.integration.vllm import vllm_multi_process_adapter as vmpa
+
+    global _orig_wrap_kv_caches
+    if _orig_wrap_kv_caches is None:
+        _orig_wrap_kv_caches = vmpa.wrap_kv_caches
+    vmpa.wrap_kv_caches = _wrap_npu_kv_caches  # type: ignore[assignment]
+
+    # The server's context factory must inspect both tensors in an Ascend
+    # layer's (K, V) IPC wrapper before it selects NPUCacheContext.
+    from lmcache.v1.platform import cache_context
+
+    global _orig_detect_device_type
+    if _orig_detect_device_type is None:
+        _orig_detect_device_type = cache_context._detect_device_type
+    cache_context._detect_device_type = _detect_npu_kv_cache_device_type
+
+    # torch_npu exposes Event.from_ipc_handle but the driver rejects handles
+    # exported by the MP server (ACL 107017). The NPU server synchronizes the
+    # transfer before replying, so its ZMQ response is the completion fence.
+    from lmcache.v1.multiprocess import futures as mp_futures
+
+    global _orig_cuda_future_methods
+    if _orig_cuda_future_methods is None:
+        _orig_cuda_future_methods = (
+            mp_futures.CUDAMessagingFuture._on_raw_future_complete,
+            mp_futures.CUDAMessagingFuture.query,
+            mp_futures.CUDAMessagingFuture.wait,
+        )
+    mp_futures.CUDAMessagingFuture._on_raw_future_complete = _npu_future_complete
+    mp_futures.CUDAMessagingFuture.query = _npu_future_query
+    mp_futures.CUDAMessagingFuture.wait = _npu_future_wait
+
+    logger.info(
+        "Installed NPU block-level LMCache-driven MP transfer "
+        "(enable via LMCACHE_MP_TRANSFER_MODE=lmcache_driven)"
+    )
 
 
 def _gather_wrapper(
@@ -909,7 +1133,10 @@ def install_overrides() -> None:
 
     Finally patches ``compute_kv_layout`` (on ``base`` and ``worker_transfer``)
     so the SHM server allocates the rank-3 buffer the fused MLA/DSA kernel
-    consumes; see :func:`_compute_kv_layout_wrapper`.
+    consumes; see :func:`_compute_kv_layout_wrapper`, and wires the
+    LMCache-driven block-level MP path via
+    :func:`_install_lmcache_driven_overrides` (no-op without the compiled block
+    kernels).
     """
     global _orig_gather
     global _orig_scatter
@@ -948,6 +1175,11 @@ def install_overrides() -> None:
         _orig_compute_kv_layout = base.compute_kv_layout
     base.compute_kv_layout = _compute_kv_layout_wrapper  # type: ignore[assignment]
     wt.compute_kv_layout = _compute_kv_layout_wrapper  # type: ignore[assignment]
+
+    # LMC-A: wire the LMCache-driven block-level MP path (design doc 6.1).
+    # No-op without the compiled block kernels, so this stays safe on hosts
+    # where the extension lacks execute_object_group_transfer.
+    _install_lmcache_driven_overrides()
 
     logger.info(
         "Installed NPU fused gather/scatter + transfer-stream submit override "
