@@ -272,6 +272,10 @@ def get_fused_rope(
     dummy_vllm_config = MagicMock()
     dummy_vllm_config.parallel_config.data_parallel_size = 1
     dummy_vllm_config.compilation_config.static_forward_context = False
+    # vllm-ascend >=0.23's set_additional_forward_context takes a v2-model-runner
+    # path that dereferences attn_metadata.values()[0]; the v1 path returns
+    # early. Force the v1 path so the MagicMock attn_metadata is never indexed.
+    dummy_vllm_config.use_v2_model_runner = False
     dummy_attn_metadata = MagicMock()
 
     with set_forward_context(dummy_attn_metadata, dummy_vllm_config):
@@ -322,6 +326,10 @@ def get_fused_rope_from_rotary_emb(rotary_emb) -> Optional[Callable[..., Any]]:
     dummy_vllm_config = MagicMock()
     dummy_vllm_config.parallel_config.data_parallel_size = 1
     dummy_vllm_config.compilation_config.static_forward_context = False
+    # vllm-ascend >=0.23's set_additional_forward_context takes a v2-model-runner
+    # path that dereferences attn_metadata.values()[0]; the v1 path returns
+    # early. Force the v1 path so the MagicMock attn_metadata is never indexed.
+    dummy_vllm_config.use_v2_model_runner = False
     dummy_attn_metadata = MagicMock()
 
     with set_forward_context(dummy_attn_metadata, dummy_vllm_config):
