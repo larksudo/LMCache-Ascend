@@ -1926,6 +1926,7 @@ def test_multi_plane_windowed_cross_block_boundary_bulk() -> None:
 
 
 # --- int8 kernel tests (ported from LMCache-Ascend PR #282 / #281) ---
+@pytest.mark.parametrize("num_tokens", [256, 1024])
 @pytest.mark.parametrize("num_layers", [1, 8])
 @pytest.mark.parametrize("num_heads", [8])
 @pytest.mark.parametrize("block_size", [128])
