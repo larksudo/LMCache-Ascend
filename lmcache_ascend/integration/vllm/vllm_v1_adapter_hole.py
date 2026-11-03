@@ -267,6 +267,11 @@ class HoleRequestTracker(RequestTracker):
             prompt_len=len(new_request.prompt_token_ids),
             token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
             allocated_block_ids=unfolded_block_ids,
+            # The inherited multi-group RequestTracker derives num_kv_groups
+            # from this field; leave it empty and the first running-request
+            # update() raises "expected_num_groups must be >= 1, got 0".
+            # Hole requests keep the legacy single-group layout.
+            allocated_block_ids_by_group=(unfolded_block_ids,),
             num_saved_tokens=initial_saved_tokens,
             disagg_spec=disagg_spec,
             mm_hashes=mm_hashes,
