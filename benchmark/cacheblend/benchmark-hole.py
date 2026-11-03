@@ -109,6 +109,7 @@ def _engine_args_to_kwargs(llm_args: "EngineArgs") -> dict:
         "tensor_parallel_size": llm_args.tensor_parallel_size,
         "max_num_seqs": llm_args.max_num_seqs,
         "trust_remote_code": llm_args.trust_remote_code,
+        "block_size": getattr(llm_args, "block_size", None),
     }
 
 
@@ -150,6 +151,7 @@ def build_llm_with_lmcache(
         tensor_parallel_size=tp_size,
         max_num_seqs=bs,
         trust_remote_code=True,
+        block_size=128,
     )
 
     llm = LLM(**_engine_args_to_kwargs(llm_args))
@@ -179,6 +181,7 @@ def build_llm_with_vllm(
         tensor_parallel_size=tp_size,
         max_num_seqs=bs,
         trust_remote_code=True,
+        block_size=128,
     )
 
     llm = LLM(**_engine_args_to_kwargs(llm_args))
