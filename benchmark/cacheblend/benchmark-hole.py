@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from dataclasses import asdict
+from dataclasses import asdict  # noqa: F401  # kept for callers of this module
 from typing import Any, Iterable, Optional
 import contextlib
 import csv
@@ -90,6 +90,28 @@ def _enable_benchmark_log_tee() -> None:
     print(f"[benchmark-hole] stream tee enabled: {log_path}", flush=True)
 
 
+def _engine_args_to_kwargs(llm_args: "EngineArgs") -> dict:
+    """Flatten EngineArgs into LLM kwargs.
+
+    ``dataclasses.asdict`` recurses into nested config dataclasses (e.g.
+    ``CompilationConfig``) and materializes their optional members as ``None``,
+    which newer vLLM pydantic configs reject. Passing the explicit members we
+    set keeps construction valid across vLLM versions.
+    """
+    return {
+        "model": llm_args.model,
+        "kv_transfer_config": getattr(llm_args, "kv_transfer_config", None),
+        "max_model_len": llm_args.max_model_len,
+        "gpu_memory_utilization": llm_args.gpu_memory_utilization,
+        "enable_prefix_caching": llm_args.enable_prefix_caching,
+        "enable_chunked_prefill": llm_args.enable_chunked_prefill,
+        "enforce_eager": llm_args.enforce_eager,
+        "tensor_parallel_size": llm_args.tensor_parallel_size,
+        "max_num_seqs": llm_args.max_num_seqs,
+        "trust_remote_code": llm_args.trust_remote_code,
+    }
+
+
 def get_lmcache_connector_spec(enable_holes: bool) -> tuple[str, str]:
     if enable_holes:
         return (
@@ -130,7 +152,7 @@ def build_llm_with_lmcache(
         trust_remote_code=True,
     )
 
-    llm = LLM(**asdict(llm_args))
+    llm = LLM(**_engine_args_to_kwargs(llm_args))
     try:
         yield llm
     finally:
@@ -159,7 +181,7 @@ def build_llm_with_vllm(
         trust_remote_code=True,
     )
 
-    llm = LLM(**asdict(llm_args))
+    llm = LLM(**_engine_args_to_kwargs(llm_args))
     try:
         yield llm
     finally:
