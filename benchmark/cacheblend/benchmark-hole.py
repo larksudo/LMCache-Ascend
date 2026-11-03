@@ -1577,18 +1577,19 @@ def main(cfg: DictConfig):
         user_content = "998244353"
         messages = [{"role": "user", "content": user_content}]
         # Use CPU for preparation
-        full_encoded = (
-            tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_special_tokens=True,
-                add_generation_prompt=True,
-                enable_thinking=False,
-                return_tensors="pt",
-            )
-            .to(torch.long)
-            .reshape(1, -1)
+        full_encoded = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_special_tokens=True,
+            add_generation_prompt=True,
+            enable_thinking=False,
+            return_tensors="pt",
         )
+        if hasattr(full_encoded, "input_ids"):
+            # transformers >= 5 returns a BatchEncoding here even with
+            # return_tensors="pt"; older versions return the tensor directly.
+            full_encoded = full_encoded.input_ids
+        full_encoded = full_encoded.to(torch.long).reshape(1, -1)
         instruction_tokens = tokenize1(user_content)
 
         for i in range(full_encoded.shape[1] - instruction_tokens.shape[1] + 1):
