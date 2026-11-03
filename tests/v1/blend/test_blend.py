@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-import lmcache_ascend.v1.blend.blender as blender_impl
 from unittest.mock import Mock, patch
 
 # Third Party
